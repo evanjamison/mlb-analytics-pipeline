@@ -1,10 +1,19 @@
 name: MLB daily update & retrain
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # allow manual runs
   schedule:
-    # 17:15 UTC ≈ 9:15 AM Pacific (standard time). DST shifts ±1h.
+    # 17:15 UTC ≈ 9:15 AM Pacific during Standard Time (8:15 AM during DST)
     - cron: "15 17 * * *"
+
+# Needed to push committed outputs back to the repo
+permissions:
+  contents: write
+
+# Avoid overlapping runs
+concurrency:
+  group: mlb-pipeline
+  cancel-in-progress: false
 
 jobs:
   update-train:
@@ -14,49 +23,30 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
+          cache: "pip"
 
-      # ---------------------------------------------------------------------
-      # FIXED DEPENDENCIES — pins NumPy to 1.x, installs MLB-StatsAPI (correct name)
-      # ---------------------------------------------------------------------
-      - name: Install deps (NumPy 1.26 line + MLB-StatsAPI)
+      - name: Install deps (with fallback)
+        shell: bash
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install \
-            numpy==1.26.4 \
-            scipy==1.11.4 \
-            pandas==2.2.2 \
-            matplotlib==3.8.4 \
-            scikit-learn==1.4.2 \
-            xgboost==2.0.3 \
-            lightgbm==4.5.0 \
-            catboost==1.2.5 \
-            statsmodels==0.14.1 \
-            requests==2.32.3 \
-            tqdm==4.66.4 \
-            pybaseball==2.2.7
-          # Correct modern package name:
-          pip install "git+https://github.com/toddrob99/MLB-StatsAPI.git#egg=mlb-statsapi"
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install numpy pandas scikit-learn matplotlib statsmodels pybaseball statsapi lightgbm xgboost catboost joblib tqdm
+          fi
 
-      - name: Ensure output directories exist
-        run: mkdir -p out model_all_ts
-
-      # -------------------- PIPELINE STEPS --------------------
+      # --- Your pipeline steps (adjust paths/args as needed) ---
       - name: Ingest latest games
         run: |
           python scripts/data_ingest.py --year 2025 --backfill-days 35 --only-ingest
 
       - name: Prepare features
         run: |
-          python scripts/prepare_features.py \
-            --data out/raw_games.csv \
-            --date-col game_date \
-            --id-col game_pk \
-            --target home_win \
-            --out out/mlb_features_prepared.csv
+          python scripts/prepare_features.py --in out/raw_games.csv --out out/mlb_features_prepared.csv
 
       - name: Train / retrain model
         run: |
@@ -75,6 +65,7 @@ jobs:
             --n-splits 6
 
       - name: Commit results (if changed)
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -86,19 +77,22 @@ jobs:
             git push
           fi
 
-      # ------------------------ EMAIL ALERTS ------------------------
+      # ---------------- EMAIL ALERTS ----------------
+      # Configure repo secrets:
+      # SMTP_SERVER=smtp.gmail.com, SMTP_PORT=465, SMTP_USERNAME=you@gmail.com,
+      # SMTP_PASSWORD=<Google App Password>, ALERT_FROM=you@gmail.com, ALERT_TO=you@gmail.com
       - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
+          secure: true
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "✅ MLB pipeline SUCCESS — ${{ github.repository }} #${{ github.run_number }}"
-          to: ${{ secrets.ALERT_TO }}
           from: ${{ secrets.ALERT_FROM }}
-          secure: true
+          to: ${{ secrets.ALERT_TO }}
+          subject: "✅ MLB pipeline SUCCESS — ${{ github.repository }} #${{ github.run_number }}"
           html_body: |
             <h2>MLB pipeline run succeeded</h2>
             <ul>
@@ -108,7 +102,6 @@ jobs:
               <li><b>Commit:</b> ${{ github.sha }}</li>
               <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
-            <p>Artifacts and model outputs were committed if there were changes.</p>
 
       - name: Send failure email
         if: failure()
@@ -116,22 +109,16 @@ jobs:
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
+          secure: true
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "❌ MLB pipeline FAILED — ${{ github.repository }} #${{ github.run_number }}"
-          to: ${{ secrets.ALERT_TO }}
           from: ${{ secrets.ALERT_FROM }}
-          secure: true
+          to: ${{ secrets.ALERT_TO }}
+          subject: "❌ MLB pipeline FAILED — ${{ github.repository }} #${{ github.run_number }}"
           html_body: |
             <h2>MLB pipeline run failed</h2>
-            <ul>
-              <li><b>Repo:</b> ${{ github.repository }}</li>
-              <li><b>Run ID:</b> ${{ github.run_id }}</li>
-              <li><b>Branch:</b> ${{ github.ref_name }}</li>
-              <li><b>Commit:</b> ${{ github.sha }}</li>
-              <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
-            </ul>
             <p>Check the Actions logs for the failing step.</p>
+
 
 
 
