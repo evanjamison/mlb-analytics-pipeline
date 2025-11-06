@@ -1,9 +1,9 @@
 name: MLB daily update & retrain
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    # 9:15 AM Pacific (17:15 UTC during Standard Time; will be 16:15 UTC in DST)
+    # 17:15 UTC ≈ 9:15 AM Pacific (standard time). DST will shift an hour.
     - cron: "15 17 * * *"
 
 jobs:
@@ -19,22 +19,33 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (use requirements.txt if present, else fallback)
+      # -------- FIXED / PINNED DEPS (incl. MLB-StatsAPI from GitHub) ----------
+      - name: Install deps (pinned, with MLB-StatsAPI fallback)
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install numpy pandas matplotlib scikit-learn xgboost lightgbm catboost statsmodels requests tqdm pybaseball statsapi
-          fi
+          python -m pip install --upgrade pip setuptools wheel
+          # Core DS stack (versions that work well on Actions with py3.11)
+          pip install \
+            numpy==2.0.2 \
+            pandas==2.2.2 \
+            matplotlib==3.8.4 \
+            scikit-learn==1.4.2 \
+            xgboost==2.0.3 \
+            lightgbm==4.5.0 \
+            catboost==1.2.5 \
+            statsmodels==0.14.1 \
+            requests==2.32.3 \
+            tqdm==4.66.4 \
+            pybaseball==2.2.7
+          # StatsAPI (PyPI is flaky on some runners) -> install from GitHub
+          pip install "git+https://github.com/toddrob99/MLB-StatsAPI.git#egg=statsapi"
 
-      - name: Ensure output folder exists
+      - name: Ensure out/ exists
         run: mkdir -p out
 
+      # -------------------- YOUR PIPELINE STEPS --------------------
       - name: Ingest latest games
         run: |
           python scripts/data_ingest.py --year 2025 --backfill-days 35 --only-ingest
-          ls -al out
 
       - name: Prepare features
         run: |
@@ -44,7 +55,6 @@ jobs:
             --id-col game_pk \
             --target home_win \
             --out out/mlb_features_prepared.csv
-          ls -al out
 
       - name: Train / retrain model
         run: |
@@ -74,7 +84,7 @@ jobs:
             git push
           fi
 
-      # ---------------- EMAIL ALERTS ----------------
+      # ------------------------ EMAIL ALERTS ------------------------
       - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
@@ -112,5 +122,7 @@ jobs:
           html_body: |
             <h2>MLB pipeline run failed</h2>
             <p>Check the Actions logs for the failing step.</p>
+
+
 
 
