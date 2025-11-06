@@ -3,7 +3,7 @@ name: MLB daily update & retrain
 on:
   workflow_dispatch:   # allow manual runs
   schedule:
-    # GitHub cron is UTC. 17:15 UTC ≈ 9:15 AM Pacific (standard time).
+    # GitHub cron is UTC. 17:15 UTC ≈ 9:15 AM Pacific (standard time)
     - cron: "15 17 * * *"
 
 jobs:
@@ -14,13 +14,11 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.11  # 👈 switch to 3.11 for library compatibility
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          # Do NOT set cache or cache-dependency-path since we don't have requirements.txt yet
+          python-version: "3.11"
 
-      # ---------- Dependencies ----------
       - name: Install deps (use requirements.txt if present, else fallback)
         run: |
           set -e
@@ -39,14 +37,13 @@ jobs:
               xgboost \
               lightgbm \
               catboost \
-              statsmodels \
+              "statsmodels<1.0" \
               requests \
               tqdm \
               pybaseball \
-              statsapi
+              git+https://github.com/toddrob99/MLB-StatsAPI.git
           fi
 
-      # ---------- Your pipeline ----------
       - name: Ingest latest games
         run: |
           python scripts/data_ingest.py --year 2025 --backfill-days 35 --only-ingest
@@ -83,7 +80,6 @@ jobs:
             git push
           fi
 
-      # ---------- Email alerts ----------
       - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
@@ -129,4 +125,5 @@ jobs:
               <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
             <p>Check the Actions logs for the failing step.</p>
+
 
