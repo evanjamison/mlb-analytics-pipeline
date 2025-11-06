@@ -1,65 +1,85 @@
 name: MLB daily update & retrain
 
 on:
-  workflow_dispatch:   # allow manual runs
+  workflow_dispatch: {}
   schedule:
-    # GitHub cron is UTC. 17:15 UTC ≈ 9:15 AM Pacific (standard time)
+    # 17:15 UTC ≈ 9:15 AM Pacific (Standard Time)
     - cron: "15 17 * * *"
+
+permissions:
+  contents: write
 
 jobs:
   update-train:
     runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND: "Agg"     # headless plots
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11  # 👈 switch to 3.11 for library compatibility
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (use requirements.txt if present, else fallback)
-        run: |
-          set -e
-          python -m pip install --upgrade pip
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-          if [ -f "requirements.txt" ]; then
-            echo "Found requirements.txt — installing from it..."
+      - name: Install deps (use requirements.txt if present, else fallback)
+        shell: bash
+        run: |
+          python -V
+          if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            echo "No requirements.txt found — installing fallback packages..."
             pip install \
-              numpy \
-              pandas \
-              matplotlib \
-              scikit-learn \
-              xgboost \
-              lightgbm \
-              catboost \
-              "statsmodels<1.0" \
-              requests \
-              tqdm \
-              pybaseball \
-              git+https://github.com/toddrob99/MLB-StatsAPI.git
+              numpy pandas matplotlib scikit-learn xgboost lightgbm catboost \
+              statsmodels requests tqdm pybaseball statsapi
           fi
 
-      - name: Ingest latest games
+      - name: Ensure output folders
         run: |
-          python scripts/data_ingest.py --year 2025 --backfill-days 35 --only-ingest
+          mkdir -p out
+          mkdir -p out/model_all_ts
+
+      # ---------- YOUR PIPELINE ----------
+
+      - name: Ingest latest games
+        shell: bash
+        run: |
+          # Adjust this command if your ingest script/flags differ.
+          python scripts/ingest_games.py --out out/raw_games.csv
 
       - name: Prepare features
+        shell: bash
         run: |
-          python scripts/prepare_features.py --in out/raw_games.csv --out out/mlb_features_prepared.csv
+          # FIX: use --data (not --in) to match argparse in prepare_features.py
+          python scripts/prepare_features.py \
+            --data out/raw_games.csv \
+            --out out/mlb_features_prepared.csv \
+            --date-col game_date \
+            --id-col game_pk \
+            --target home_win
 
       - name: Train / retrain model
+        shell: bash
         run: |
+          # Linux paths; quotes not required
           python scripts/model_train_allinone.py \
-            --data "out/mlb_features_prepared.csv" \
+            --data out/mlb_features_prepared.csv \
             --date-col game_date \
             --id-col game_pk \
             --target home_win \
-            --outdir "model_all_ts" \
+            --outdir out/model_all_ts \
             --topk 25 \
             --threshold-strategy f1 \
             --add-rolling \
@@ -68,62 +88,32 @@ jobs:
             --walkforward ts \
             --n-splits 6
 
-      - name: Commit results (if changed)
+      # ---------- OUTPUTS ----------
+
+      - name: Upload artifacts (features + models + plots)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlb-training-output
+          path: |
+            out/mlb_features_prepared.csv
+            out/model_all_ts/**
+          if-no-files-found: warn
+
+      # Optional: commit results back to main (disable if you don't want repo churn)
+      - name: Commit updated outputs back to main
+        if: ${{ github.ref == 'refs/heads/main' }}
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Only add if something actually changed
+          git add out/mlb_features_prepared.csv out/model_all_ts || true
+          if ! git diff --cached --quiet; then
+            git commit -m "CI: update features & models [skip ci]"
+            git push origin HEAD:main
           else
-            git commit -m "CI: ingest + feature prep + retrain (auto)"
-            git push
+            echo "No changes to commit."
           fi
 
-      - name: Send success email
-        if: success()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          secure: true
-          from: ${{ secrets.ALERT_FROM }}
-          to: ${{ secrets.ALERT_TO }}
-          subject: "✅ MLB pipeline SUCCESS — ${{ github.repository }} #${{ github.run_number }}"
-          html_body: |
-            <h2>MLB pipeline run succeeded</h2>
-            <ul>
-              <li><b>Repo:</b> ${{ github.repository }}</li>
-              <li><b>Run ID:</b> ${{ github.run_id }}</li>
-              <li><b>Branch:</b> ${{ github.ref_name }}</li>
-              <li><b>Commit:</b> ${{ github.sha }}</li>
-              <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
-            </ul>
-            <p>Artifacts and model outputs were committed if there were changes.</p>
-
-      - name: Send failure email
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          secure: true
-          from: ${{ secrets.ALERT_FROM }}
-          to: ${{ secrets.ALERT_TO }}
-          subject: "❌ MLB pipeline FAILED — ${{ github.repository }} #${{ github.run_number }}"
-          html_body: |
-            <h2>MLB pipeline run failed</h2>
-            <ul>
-              <li><b>Repo:</b> ${{ github.repository }}</li>
-              <li><b>Run ID:</b> ${{ github.run_id }}</li>
-              <li><b>Branch:</b> ${{ github.ref_name }}</li>
-              <li><b>Commit:</b> ${{ github.sha }}</li>
-              <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
-            </ul>
-            <p>Check the Actions logs for the failing step.</p>
 
 
