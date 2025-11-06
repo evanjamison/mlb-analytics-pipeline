@@ -3,7 +3,7 @@ name: MLB daily update & retrain
 on:
   workflow_dispatch:
   schedule:
-    # 17:15 UTC ≈ 9:15 AM Pacific (standard time). DST will shift an hour.
+    # 17:15 UTC ≈ 9:15 AM Pacific (standard time). DST shifts ±1h.
     - cron: "15 17 * * *"
 
 jobs:
@@ -19,13 +19,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      # -------- FIXED / PINNED DEPS (incl. MLB-StatsAPI from GitHub) ----------
-      - name: Install deps (pinned, with MLB-StatsAPI fallback)
+      # ---------------------------------------------------------------------
+      # FIXED DEPENDENCIES — pins NumPy to 1.x, installs StatsAPI from GitHub
+      # ---------------------------------------------------------------------
+      - name: Install deps (NumPy 1.26 line + MLB-StatsAPI fallback)
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          # Core DS stack (versions that work well on Actions with py3.11)
           pip install \
-            numpy==2.0.2 \
+            numpy==1.26.4 \
+            scipy==1.11.4 \
             pandas==2.2.2 \
             matplotlib==3.8.4 \
             scikit-learn==1.4.2 \
@@ -36,13 +38,12 @@ jobs:
             requests==2.32.3 \
             tqdm==4.66.4 \
             pybaseball==2.2.7
-          # StatsAPI (PyPI is flaky on some runners) -> install from GitHub
           pip install "git+https://github.com/toddrob99/MLB-StatsAPI.git#egg=statsapi"
 
-      - name: Ensure out/ exists
-        run: mkdir -p out
+      - name: Ensure output directories exist
+        run: mkdir -p out model_all_ts
 
-      # -------------------- YOUR PIPELINE STEPS --------------------
+      # -------------------- PIPELINE STEPS --------------------
       - name: Ingest latest games
         run: |
           python scripts/data_ingest.py --year 2025 --backfill-days 35 --only-ingest
@@ -106,6 +107,7 @@ jobs:
               <li><b>Commit:</b> ${{ github.sha }}</li>
               <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
+            <p>Artifacts and model outputs were committed if there were changes.</p>
 
       - name: Send failure email
         if: failure()
@@ -121,6 +123,13 @@ jobs:
           secure: true
           html_body: |
             <h2>MLB pipeline run failed</h2>
+            <ul>
+              <li><b>Repo:</b> ${{ github.repository }}</li>
+              <li><b>Run ID:</b> ${{ github.run_id }}</li>
+              <li><b>Branch:</b> ${{ github.ref_name }}</li>
+              <li><b>Commit:</b> ${{ github.sha }}</li>
+              <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
+            </ul>
             <p>Check the Actions logs for the failing step.</p>
 
 
