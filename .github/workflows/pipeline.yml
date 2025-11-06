@@ -1,9 +1,9 @@
 name: MLB daily update & retrain
 
 on:
-  workflow_dispatch:   # allow manual runs
+  workflow_dispatch: {}
   schedule:
-    # GitHub cron is UTC. 17:15 UTC ≈ 9:15 AM Pacific (standard time)
+    # 9:15 AM Pacific (17:15 UTC during Standard Time; will be 16:15 UTC in DST)
     - cron: "15 17 * * *"
 
 jobs:
@@ -14,43 +14,37 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11  # 👈 switch to 3.11 for library compatibility
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps (use requirements.txt if present, else fallback)
         run: |
-          set -e
           python -m pip install --upgrade pip
-
-          if [ -f "requirements.txt" ]; then
-            echo "Found requirements.txt — installing from it..."
+          if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            echo "No requirements.txt found — installing fallback packages..."
-            pip install \
-              numpy \
-              pandas \
-              matplotlib \
-              scikit-learn \
-              xgboost \
-              lightgbm \
-              catboost \
-              "statsmodels<1.0" \
-              requests \
-              tqdm \
-              pybaseball \
-              git+https://github.com/toddrob99/MLB-StatsAPI.git
+            pip install numpy pandas matplotlib scikit-learn xgboost lightgbm catboost statsmodels requests tqdm pybaseball statsapi
           fi
+
+      - name: Ensure output folder exists
+        run: mkdir -p out
 
       - name: Ingest latest games
         run: |
           python scripts/data_ingest.py --year 2025 --backfill-days 35 --only-ingest
+          ls -al out
 
       - name: Prepare features
         run: |
-          python scripts/prepare_features.py --in out/raw_games.csv --out out/mlb_features_prepared.csv
+          python scripts/prepare_features.py \
+            --data out/raw_games.csv \
+            --date-col game_date \
+            --id-col game_pk \
+            --target home_win \
+            --out out/mlb_features_prepared.csv
+          ls -al out
 
       - name: Train / retrain model
         run: |
@@ -80,6 +74,7 @@ jobs:
             git push
           fi
 
+      # ---------------- EMAIL ALERTS ----------------
       - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
@@ -88,10 +83,10 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          secure: true
-          from: ${{ secrets.ALERT_FROM }}
-          to: ${{ secrets.ALERT_TO }}
           subject: "✅ MLB pipeline SUCCESS — ${{ github.repository }} #${{ github.run_number }}"
+          to: ${{ secrets.ALERT_TO }}
+          from: ${{ secrets.ALERT_FROM }}
+          secure: true
           html_body: |
             <h2>MLB pipeline run succeeded</h2>
             <ul>
@@ -101,7 +96,6 @@ jobs:
               <li><b>Commit:</b> ${{ github.sha }}</li>
               <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
-            <p>Artifacts and model outputs were committed if there were changes.</p>
 
       - name: Send failure email
         if: failure()
@@ -111,19 +105,12 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          secure: true
-          from: ${{ secrets.ALERT_FROM }}
-          to: ${{ secrets.ALERT_TO }}
           subject: "❌ MLB pipeline FAILED — ${{ github.repository }} #${{ github.run_number }}"
+          to: ${{ secrets.ALERT_TO }}
+          from: ${{ secrets.ALERT_FROM }}
+          secure: true
           html_body: |
             <h2>MLB pipeline run failed</h2>
-            <ul>
-              <li><b>Repo:</b> ${{ github.repository }}</li>
-              <li><b>Run ID:</b> ${{ github.run_id }}</li>
-              <li><b>Branch:</b> ${{ github.ref_name }}</li>
-              <li><b>Commit:</b> ${{ github.sha }}</li>
-              <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
-            </ul>
             <p>Check the Actions logs for the failing step.</p>
 
 
