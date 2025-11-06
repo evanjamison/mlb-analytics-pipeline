@@ -1,0 +1,12 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+xgboost
+lightgbm
+catboost
+statsmodels
+requests
+tqdm
+pybaseball
+statsapi
