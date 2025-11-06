@@ -20,9 +20,9 @@ jobs:
           python-version: "3.11"
 
       # ---------------------------------------------------------------------
-      # FIXED DEPENDENCIES — pins NumPy to 1.x, installs StatsAPI from GitHub
+      # FIXED DEPENDENCIES — pins NumPy to 1.x, installs MLB-StatsAPI (correct name)
       # ---------------------------------------------------------------------
-      - name: Install deps (NumPy 1.26 line + MLB-StatsAPI fallback)
+      - name: Install deps (NumPy 1.26 line + MLB-StatsAPI)
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install \
@@ -38,7 +38,8 @@ jobs:
             requests==2.32.3 \
             tqdm==4.66.4 \
             pybaseball==2.2.7
-          pip install "git+https://github.com/toddrob99/MLB-StatsAPI.git#egg=statsapi"
+          # Correct modern package name:
+          pip install "git+https://github.com/toddrob99/MLB-StatsAPI.git#egg=mlb-statsapi"
 
       - name: Ensure output directories exist
         run: mkdir -p out model_all_ts
@@ -131,6 +132,7 @@ jobs:
               <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
             <p>Check the Actions logs for the failing step.</p>
+
 
 
 
