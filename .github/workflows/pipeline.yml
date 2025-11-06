@@ -3,8 +3,7 @@ name: MLB daily update & retrain
 on:
   workflow_dispatch:
   schedule:
-    # 09:15 AM Pacific (17:15 UTC during Standard Time; DST will shift)
-    - cron: "15 17 * * *"
+    - cron: "15 17 * * *"   # 9:15 AM PT (standard time)
 
 jobs:
   update-train:
@@ -23,42 +22,27 @@ jobs:
         shell: bash
         run: |
           set -e
-          python -V
           python -m pip install --upgrade pip setuptools wheel
-
           FAILED_REQ=0
           if [ -f "requirements.txt" ]; then
-            echo "Found requirements.txt — installing..."
-            # Try once; if it fails, we fall back
             if ! pip install -r requirements.txt ; then
-              echo "requirements.txt failed; will fall back to curated list."
               FAILED_REQ=1
             fi
           else
-            echo "No requirements.txt found; will use curated list."
             FAILED_REQ=1
           fi
-
           if [ "$FAILED_REQ" = "1" ]; then
-            echo "Installing curated fallback set (wheels only if possible)..."
-            # Prefer binary wheels; these versions play nicely with Py3.11 runners
             pip install --upgrade \
-              "numpy<2.2" \
-              "pandas<2.3" \
-              "matplotlib>=3.8" \
-              "scikit-learn>=1.4" \
-              "xgboost>=2.0" \
-              "lightgbm>=4.0" \
-              "catboost>=1.2.5" \
-              "statsmodels>=0.14" \
-              "requests>=2.31" \
-              "tqdm>=4.66" \
-              pybaseball \
-              mlb-statsapi
+              "numpy<2.2" "pandas<2.3" "matplotlib>=3.8" \
+              "scikit-learn>=1.4" "xgboost>=2.0" "lightgbm>=4.0" \
+              "catboost>=1.2.5" "statsmodels>=0.14" "requests>=2.31" \
+              "tqdm>=4.66" pybaseball mlb-statsapi
           else
-            # requirements.txt succeeded — fix common name mismatch just in case
             pip install --upgrade mlb-statsapi || true
           fi
+
+      - name: Ensure output dir
+        run: mkdir -p out
 
       - name: Ingest latest games
         run: |
@@ -66,7 +50,9 @@ jobs:
 
       - name: Prepare features
         run: |
-          python scripts/prepare_features.py --in out/raw_games.csv --out out/mlb_features_prepared.csv
+          python scripts/prepare_features.py \
+            --data out/raw_games.csv \
+            --out out/mlb_features_prepared.csv
 
       - name: Train / retrain model
         shell: bash
