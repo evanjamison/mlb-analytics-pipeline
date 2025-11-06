@@ -1,9 +1,9 @@
 name: MLB daily update & retrain
 
 on:
-  workflow_dispatch:   # allow manual runs
+  workflow_dispatch:
   schedule:
-    # GitHub cron is UTC. 17:15 UTC ≈ 9:15 AM Pacific (standard time).
+    # 09:15 AM Pacific (17:15 UTC during Standard Time; DST will shift)
     - cron: "15 17 * * *"
 
 jobs:
@@ -14,39 +14,52 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          # Do NOT set cache or cache-dependency-path since we don't have requirements.txt yet
+          python-version: "3.11"
 
-      # ---------- Dependencies ----------
-      - name: Install deps (use requirements.txt if present, else fallback)
+      - name: Install deps (try requirements.txt, else robust fallback)
+        shell: bash
         run: |
           set -e
-          python -m pip install --upgrade pip
+          python -V
+          python -m pip install --upgrade pip setuptools wheel
 
+          FAILED_REQ=0
           if [ -f "requirements.txt" ]; then
-            echo "Found requirements.txt — installing from it..."
-            pip install -r requirements.txt
+            echo "Found requirements.txt — installing..."
+            # Try once; if it fails, we fall back
+            if ! pip install -r requirements.txt ; then
+              echo "requirements.txt failed; will fall back to curated list."
+              FAILED_REQ=1
+            fi
           else
-            echo "No requirements.txt found — installing fallback packages..."
-            pip install \
-              numpy \
-              pandas \
-              matplotlib \
-              scikit-learn \
-              xgboost \
-              lightgbm \
-              catboost \
-              statsmodels \
-              requests \
-              tqdm \
-              pybaseball \
-              statsapi
+            echo "No requirements.txt found; will use curated list."
+            FAILED_REQ=1
           fi
 
-      # ---------- Your pipeline ----------
+          if [ "$FAILED_REQ" = "1" ]; then
+            echo "Installing curated fallback set (wheels only if possible)..."
+            # Prefer binary wheels; these versions play nicely with Py3.11 runners
+            pip install --upgrade \
+              "numpy<2.2" \
+              "pandas<2.3" \
+              "matplotlib>=3.8" \
+              "scikit-learn>=1.4" \
+              "xgboost>=2.0" \
+              "lightgbm>=4.0" \
+              "catboost>=1.2.5" \
+              "statsmodels>=0.14" \
+              "requests>=2.31" \
+              "tqdm>=4.66" \
+              pybaseball \
+              mlb-statsapi
+          else
+            # requirements.txt succeeded — fix common name mismatch just in case
+            pip install --upgrade mlb-statsapi || true
+          fi
+
       - name: Ingest latest games
         run: |
           python scripts/data_ingest.py --year 2025 --backfill-days 35 --only-ingest
@@ -56,6 +69,7 @@ jobs:
           python scripts/prepare_features.py --in out/raw_games.csv --out out/mlb_features_prepared.csv
 
       - name: Train / retrain model
+        shell: bash
         run: |
           python scripts/model_train_allinone.py \
             --data "out/mlb_features_prepared.csv" \
@@ -72,6 +86,7 @@ jobs:
             --n-splits 6
 
       - name: Commit results (if changed)
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -83,7 +98,6 @@ jobs:
             git push
           fi
 
-      # ---------- Email alerts ----------
       - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
@@ -92,10 +106,10 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          secure: true
-          from: ${{ secrets.ALERT_FROM }}
-          to: ${{ secrets.ALERT_TO }}
           subject: "✅ MLB pipeline SUCCESS — ${{ github.repository }} #${{ github.run_number }}"
+          to: ${{ secrets.ALERT_TO }}
+          from: ${{ secrets.ALERT_FROM }}
+          secure: true
           html_body: |
             <h2>MLB pipeline run succeeded</h2>
             <ul>
@@ -105,7 +119,6 @@ jobs:
               <li><b>Commit:</b> ${{ github.sha }}</li>
               <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
-            <p>Artifacts and model outputs were committed if there were changes.</p>
 
       - name: Send failure email
         if: failure()
@@ -115,20 +128,13 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          secure: true
-          from: ${{ secrets.ALERT_FROM }}
-          to: ${{ secrets.ALERT_TO }}
           subject: "❌ MLB pipeline FAILED — ${{ github.repository }} #${{ github.run_number }}"
+          to: ${{ secrets.ALERT_TO }}
+          from: ${{ secrets.ALERT_FROM }}
+          secure: true
           html_body: |
             <h2>MLB pipeline run failed</h2>
-            <ul>
-              <li><b>Repo:</b> ${{ github.repository }}</li>
-              <li><b>Run ID:</b> ${{ github.run_id }}</li>
-              <li><b>Branch:</b> ${{ github.ref_name }}</li>
-              <li><b>Commit:</b> ${{ github.sha }}</li>
-              <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
-            </ul>
-            <p>Check the Actions logs for the failing step.</p>
+            <p>Check the Action logs for the failing step.</p>
 
 
 
