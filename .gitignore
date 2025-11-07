@@ -16,7 +16,11 @@ __pycache__/
 .DS_Store
 
 # --- Data & artifacts (safe to regenerate)
-out/
+out/*
+!out/raw_games.csv
+!out/mlb_features_prepared.csv
+!model_all_ts/**
+
 model_*/
 eda_out*/
 pipelines/**/artifacts/
@@ -24,3 +28,4 @@ pipelines/**/reports/
 
 # --- OS / misc
 Thumbs.db
+
