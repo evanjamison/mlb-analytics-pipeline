@@ -14,6 +14,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
@@ -631,8 +632,22 @@ def main(args):
         plt.legend(); plt.tight_layout(); plt.savefig(fig_path(outdir,f"betting_profit_vs_edge__{name_for_bets}")); plt.close()
 
     # ---------------- HTML report ----------------
-    imgs=[f for f in os.listdir(outdir) if f.endswith(".png")]
-    html=f"""
+    imgs = [f for f in os.listdir(outdir) if f.endswith(".png")]
+    keep_str = "\n".join(keep)
+    leaderboard_html = pd.read_csv(os.path.join(outdir, "leaderboard.csv")).to_html(index=False)
+    monthly_html = (
+        "<h2>Monthly Walk-Forward</h2>" +
+        pd.read_csv(os.path.join(outdir, "monthly_walkforward.csv")).to_html(index=False)
+        if os.path.exists(os.path.join(outdir, "monthly_walkforward.csv")) else ""
+    )
+    ts_html = (
+        "<h2>TS Walk-Forward</h2>" +
+        pd.read_csv(os.path.join(outdir, "ts_walkforward.csv")).to_html(index=False)
+        if os.path.exists(os.path.join(outdir, "ts_walkforward.csv")) else ""
+    )
+    fig_html = "".join([f'<img src="{name}"/>' for name in sorted(imgs)])
+
+    html = f"""
     <html><head><meta charset="utf-8"/>
     <title>MLB All-in-One Model Report</title>
     <style>
@@ -644,12 +659,12 @@ def main(args):
       <p><b>Generated:</b> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
       <h2>Args</h2><pre>calibration={args.calibration} | walkforward={args.walkforward} | n_splits={args.n_splits}</pre>
       <h2>Splits</h2><pre>{os.linesep.join(splits)}</pre>
-      <h2>Kept Features (top {args.topk})</h2><pre>{"\\n".join(keep)}</pre>
-      <h2>Leaderboard</h2>{pd.read_csv(os.path.join(outdir,"leaderboard.csv")).to_html(index=False)}
-      {"<h2>Monthly Walk-Forward</h2>"+pd.read_csv(os.path.join(outdir,'monthly_walkforward.csv')).to_html(index=False) if os.path.exists(os.path.join(outdir,'monthly_walkforward.csv')) else ""}
-      {"<h2>TS Walk-Forward</h2>"+pd.read_csv(os.path.join(outdir,'ts_walkforward.csv')).to_html(index=False) if os.path.exists(os.path.join(outdir,'ts_walkforward.csv')) else ""}
+      <h2>Kept Features (top {args.topk})</h2><pre>{keep_str}</pre>
+      <h2>Leaderboard</h2>{leaderboard_html}
+      {monthly_html}
+      {ts_html}
       <h2>Figures</h2>
-      {''.join(f'<img src="{f}"/>' for f in sorted(imgs))}
+      {fig_html}
     </body></html>
     """
     with open(os.path.join(outdir,"report_allinone.html"),"w",encoding="utf-8") as f: f.write(html)
