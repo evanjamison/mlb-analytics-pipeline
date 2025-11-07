@@ -1,15 +1,22 @@
 name: MLB daily update & retrain
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    - cron: "15 17 * * *"   # 9:15 AM PT (standard time)
+    # 9:15 AM Pacific (GitHub cron runs in UTC; 17:15 UTC = 9:15 PT in Standard Time)
+    - cron: "15 17 * * *"
+
+# 3a) Minimal permissions — we only read repo contents; no writes/pushes.
+permissions:
+  contents: read
+
+concurrency:
+  group: mlb-pipeline-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   update-train:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   
 
     steps:
       - name: Check out repo
@@ -25,15 +32,15 @@ jobs:
         run: |
           set -e
           python -m pip install --upgrade pip setuptools wheel
-          FAILED_REQ=0
-          if [ -f "requirements.txt" ]; then
+          FAILED=0
+          if [ -f requirements.txt ]; then
             if ! pip install -r requirements.txt ; then
-              FAILED_REQ=1
+              FAILED=1
             fi
           else
-            FAILED_REQ=1
+            FAILED=1
           fi
-          if [ "$FAILED_REQ" = "1" ]; then
+          if [ "$FAILED" = "1" ]; then
             pip install --upgrade \
               "numpy<2.2" "pandas<2.3" "matplotlib>=3.8" \
               "scikit-learn>=1.4" "xgboost>=2.0" "lightgbm>=4.0" \
@@ -54,7 +61,7 @@ jobs:
         run: |
           python scripts/prepare_features.py \
             --data out/raw_games.csv \
-            --out out/mlb_features_prepared.csv
+            --out  out/mlb_features_prepared.csv
 
       - name: Train / retrain model
         shell: bash
@@ -73,19 +80,49 @@ jobs:
             --walkforward ts \
             --n-splits 6
 
-      - name: Commit results (if changed)
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "CI: ingest + feature prep + retrain (auto)"
-            git push
-          fi
+      # 3b) Upload artifacts instead of committing to the repo
+      - name: Upload raw ingest (CSV)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw_games.csv
+          path: out/raw_games.csv
+          if-no-files-found: warn
+          retention-days: 30
 
+      - name: Upload prepared features (CSV)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlb_features_prepared.csv
+          path: out/mlb_features_prepared.csv
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload model outputs and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model_all_ts
+          path: |
+            model_all_ts/**
+            model_all_ts/*.png
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload logs (helpful for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-and-metrics
+          path: |
+            model_all_ts/**/*.csv
+            model_all_ts/**/*.txt
+            out/**/*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Email notifications (uses your existing SMTP secrets)
       - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
@@ -107,6 +144,7 @@ jobs:
               <li><b>Commit:</b> ${{ github.sha }}</li>
               <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
+            <p>Artifacts uploaded: raw_games.csv, mlb_features_prepared.csv, model_all_ts/</p>
 
       - name: Send failure email
         if: failure()
@@ -122,11 +160,4 @@ jobs:
           secure: true
           html_body: |
             <h2>MLB pipeline run failed</h2>
-            <p>Check the Action logs for the failing step.</p>
-
-
-
-
-
-
-
+            <p>Check the run logs and downloaded artifacts (logs-and-metrics) for details.</p>
