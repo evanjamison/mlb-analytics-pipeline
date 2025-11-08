@@ -47,7 +47,7 @@ jobs:
             pip install --upgrade mlb-statsapi || true
           fi
 
-      - name: Ensure fallback feature builder exists (only used if ingest doesn’t create features)
+      - name: Ensure fallback feature builder exists (only used if your ingest doesn't create features)
         shell: bash
         run: |
           mkdir -p scripts out
@@ -90,36 +90,21 @@ print(f"[fallback] wrote {OUT} with {len(df)} rows and {len(feat)} features")
 PY
           fi
 
-      # --------- SINGLE ORCHESTRATOR (pipeline.py) WITH FALLBACK ---------
-      - name: Run pipeline.py (or fallback to manual build/train)
+      # -------------- SINGLE ORCHESTRATOR STEP --------------
+      - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out
-
-          if [ -f "scripts/pipeline.py" ] || [ -f "pipeline.py" ]; then
-            echo ">> pipeline.py detected — running orchestrator"
-            if [ -f "scripts/pipeline.py" ]; then
-              PIPE="scripts/pipeline.py"
-            else
-              PIPE="pipeline.py"
-            fi
-
-            # Try with common flags first; if your pipeline.py has different CLI it will still run without flags.
-            if ! python "$PIPE" --base-year 2024 --run-eda --add-rolling --add-interactions 2>/dev/null; then
-              echo ">> Re-running pipeline.py without flags (using its defaults)…"
-              python "$PIPE"
-            fi
-
-            # Ensure a canonical features file exists for downstream steps/artifacts
-            if [ ! -f out/mlb_features_prepared.csv ]; then
-              found="$(ls -1 out/mlb_features_*prepared*.csv 2>/dev/null | head -n1 || true)"
-              if [ -n "$found" ]; then
-                cp "$found" out/mlb_features_prepared.csv
-              fi
-            fi
+          if [ -f "scripts/run_pipeline.py" ]; then
+            echo ">> scripts/run_pipeline.py detected — running orchestrator"
+            python scripts/run_pipeline.py \
+              --base-year 2024 \
+              --run-eda \
+              --add-rolling \
+              --add-interactions
           else
-            echo ">> No pipeline.py found — using manual build/train flow"
+            echo ">> No orchestrator found — using existing manual build/train flow"
+            mkdir -p out
             success=0
             if python scripts/data_ingest.py --year 2025 --backfill-days 35 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
               success=1
@@ -137,7 +122,6 @@ PY
             if [ $success -eq 0 ]; then
               echo "ERROR: No features CSV produced."; exit 2
             fi
-
             python scripts/model_train_allinone.py \
               --data "out/mlb_features_prepared.csv" \
               --date-col game_date \
@@ -153,6 +137,7 @@ PY
               --n-splits 6
           fi
 
+      # -------------- UPLOAD ARTIFACTS --------------
       - name: Upload artifacts (reports + datasets)
         uses: actions/upload-artifact@v4
         with:
@@ -166,6 +151,7 @@ PY
             model_out/**/*
             model_all_ts/**/*
 
+      # -------------- COMMIT RESULTS --------------
       - name: Commit results (if changed)
         shell: bash
         run: |
@@ -179,6 +165,7 @@ PY
             git push
           fi
 
+      # -------------- EMAIL ALERTS --------------
       - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
