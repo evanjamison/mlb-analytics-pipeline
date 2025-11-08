@@ -1,53 +1,69 @@
-name: pipeline
+name: MLB daily update & retrain
 
 on:
-  workflow_dispatch:
-  push:
-    branches: [main, master]
+  workflow_dispatch: {}
   schedule:
-    - cron: '15 8 * * *'  # optional
+    - cron: "15 17 * * *"   # 09:15 AM Pacific
+
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  train:
+  update-train:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
 
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+          cache: "pip"
 
-      - name: Install dependencies
+      - name: Install deps (try requirements.txt, else robust fallback)
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install -U pip
-          if [[ -f requirements.txt ]]; then
-            pip install -r requirements.txt
+          python -m pip install --upgrade pip setuptools wheel
+
+          FAILED_REQ=0
+          if [[ -f "requirements.txt" ]]; then
+            if ! pip install -r requirements.txt ; then
+              FAILED_REQ=1
+            fi
           else
-            pip install \
-              "numpy>=1.22" "pandas>=2.0" "matplotlib>=3.8" \
-              "scikit-learn>=1.3" "xgboost>=2.0" "lightgbm>=4.2" \
-              "catboost>=1.2" "statsmodels>=0.14" \
-              "mlbstatsapi>=1.7.1" "pybaseball>=2.2" "requests>=2.31"
+            FAILED_REQ=1
           fi
+
+          if [[ "$FAILED_REQ" = "1" ]]; then
+            echo "⚙️ Falling back to pinned versions (Py3.11-safe)"
+            pip install --upgrade \
+              "numpy<2.2" "pandas<2.3" "matplotlib>=3.8" \
+              "scikit-learn>=1.4" "xgboost>=2.0" "lightgbm>=4.0" \
+              "catboost>=1.2.5" "statsmodels>=0.14" "requests>=2.31" \
+              "tqdm>=4.66" \
+              "pybaseball>=2.2.7" \
+              "MLB-StatsAPI>=1.7.1"
+          else
+            pip install --upgrade "MLB-StatsAPI>=1.7.1" || true
+            pip install --upgrade "pybaseball>=2.2.7" || true
+          fi
+
+      - name: Skip fallback feature builder (not needed)
+        shell: bash
+        run: |
+          echo "Skipping fallback builder. Your repo/orchestrator provides features."
 
       - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
         shell: bash
-        env:
-          PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
-
-          if [[ -f scripts/run_pipeline.py ]]; then
-            echo ">> scripts/run_pipeline.py detected - running orchestrator"
+          if [[ -f "scripts/run_pipeline.py" ]]; then
+            echo ">> scripts/run_pipeline.py detected — running orchestrator"
             python scripts/run_pipeline.py \
               --pybin python \
               --base-year 2024 \
@@ -55,45 +71,61 @@ jobs:
               --add-rolling \
               --add-interactions
           else
-            echo ">> No orchestrator found - manual flow"
+            echo ">> No orchestrator found — using manual build/train flow"
             mkdir -p out
-
-            # Raw fallback features (very slim) - only if prepare/model need something to chew on
-            python - <<'PY'
-            import os
-            import pandas as pd
-
-            RAW = "out/raw_games.csv"
-            if not os.path.exists(RAW):
-                raise SystemExit("No raw_games.csv - cannot fallback. Add scripts/run_pipeline.py instead.")
-
-            df = pd.read_csv(RAW)
-            keep = ['game_date','game_pk','home_win']
-            df = df[[c for c in keep if c in df.columns]]
-            df.to_csv("out/mlb_features_combined.csv", index=False)
-            print("[fallback] wrote out/mlb_features_combined.csv")
-            PY
-
-            # EDA (best-effort)
-            if [[ -f scripts/eda_scaffold.py ]]; then
-              python scripts/eda_scaffold.py \
-                --data "out/mlb_features_combined.csv" \
-                --date-col game_date --id-col game_pk --target home_win || true
+            success=0
+            if python scripts/data_ingest.py --year 2025 --backfill-days 35 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
+              success=1
             fi
-
-            # Prepare
-            python scripts/prepare_features.py \
-              --data "out/mlb_features_combined.csv" \
-              --out "out/mlb_features_prepared.csv" \
-              --date-col game_date --id-col game_pk --target home_win
-
-            # Train
+            if [[ $success -eq 0 ]]; then
+              if python scripts/data_ingest.py --year 2025 --backfill-days 35 --all --out out 2>/dev/null; then
+                found="$(ls -1 out/mlb_features_*prepared*.csv 2>/dev/null | head -n1 || true)"
+                if [[ -n "$found" ]]; then cp "$found" out/mlb_features_prepared.csv; success=1; fi
+              fi
+            fi
+            if [[ $success -eq 0 ]]; then
+              echo "ERROR: No features CSV produced by data_ingest."
+              exit 2
+            fi
             python scripts/model_train_allinone.py \
               --data "out/mlb_features_prepared.csv" \
-              --date-col game_date --id-col game_pk --target home_win \
-              --outdir "model_all_ts" --topk 25 --threshold-strategy f1 \
-              --add-rolling --add-interactions \
-              --calibration isotonic --walkforward monthly --n-splits 6 \
-              --min-edge 0.02 --kelly-cap 0.05
+              --date-col game_date \
+              --id-col game_pk \
+              --target home_win \
+              --outdir "model_all_ts" \
+              --topk 25 \
+              --threshold-strategy f1 \
+              --add-rolling \
+              --add-interactions \
+              --calibration isotonic \
+              --walkforward ts \
+              --n-splits 6
           fi
+
+      - name: Upload artifacts (reports + datasets)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlb-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            out/**
+            eda_out/**/*
+            eda_out_plus/**/*
+            model_out/**/*
+            model_all_ts/**/*
+
+      - name: Commit results (if changed)
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "CI: ingest + feature prep + retrain (auto)"
+            git push
+          fi
+
 
