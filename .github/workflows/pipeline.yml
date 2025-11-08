@@ -3,16 +3,11 @@ name: MLB daily update & retrain
 on:
   workflow_dispatch: {}
   schedule:
-    # 9:15 AM Pacific (GitHub cron runs in UTC; 17:15 UTC = 9:15 PT in Standard Time)
+    # 09:15 AM Pacific (Standard Time) == 17:15 UTC
     - cron: "15 17 * * *"
 
-# 3a) Minimal permissions — we only read repo contents; no writes/pushes.
 permissions:
-  contents: read
-
-concurrency:
-  group: mlb-pipeline-${{ github.ref }}
-  cancel-in-progress: false
+  contents: write
 
 jobs:
   update-train:
@@ -21,6 +16,8 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -32,15 +29,15 @@ jobs:
         run: |
           set -e
           python -m pip install --upgrade pip setuptools wheel
-          FAILED=0
-          if [ -f requirements.txt ]; then
+          FAILED_REQ=0
+          if [ -f "requirements.txt" ]; then
             if ! pip install -r requirements.txt ; then
-              FAILED=1
+              FAILED_REQ=1
             fi
           else
-            FAILED=1
+            FAILED_REQ=1
           fi
-          if [ "$FAILED" = "1" ]; then
+          if [ "$FAILED_REQ" = "1" ]; then
             pip install --upgrade \
               "numpy<2.2" "pandas<2.3" "matplotlib>=3.8" \
               "scikit-learn>=1.4" "xgboost>=2.0" "lightgbm>=4.0" \
@@ -50,79 +47,138 @@ jobs:
             pip install --upgrade mlb-statsapi || true
           fi
 
-      - name: Ensure output dir
-        run: mkdir -p out
-
-      - name: Ingest latest games
-        run: |
-          python scripts/data_ingest.py --year 2025 --backfill-days 35 --only-ingest
-
-      - name: Prepare features
-        run: |
-          python scripts/prepare_features.py \
-            --data out/raw_games.csv \
-            --out  out/mlb_features_prepared.csv
-
-      - name: Train / retrain model
+      - name: Ensure fallback feature builder exists (only used if ingest doesn’t create features)
         shell: bash
         run: |
-          python scripts/model_train_allinone.py \
-            --data "out/mlb_features_prepared.csv" \
-            --date-col game_date \
-            --id-col game_pk \
-            --target home_win \
-            --outdir "model_all_ts" \
-            --topk 25 \
-            --threshold-strategy f1 \
-            --add-rolling \
-            --add-interactions \
-            --calibration isotonic \
-            --walkforward ts \
-            --n-splits 6
+          mkdir -p scripts out
+          if [ ! -f scripts/feature_build.py ]; then
+            cat > scripts/feature_build.py <<'PY'
+import os, pandas as pd, numpy as np
+RAW = "out/raw_games.csv"
+OUT = "out/mlb_features_prepared.csv"
+DATE_COL = "game_date"
+ID_COL = "game_pk"
+TARGET = "home_win"
+if not os.path.exists(RAW):
+    raise SystemExit(f"fallback builder: {RAW} not found")
+df = pd.read_csv(RAW, low_memory=False)
+for c in [DATE_COL, ID_COL, TARGET]:
+    if c not in df.columns:
+        if c=="game_date":
+            for alt in ["date","gameDate","game_datetime","start_date"]:
+                if alt in df.columns: DATE_COL = alt; break
+        if c=="game_pk":
+            for alt in ["game_id","id","gamePk"]:
+                if alt in df.columns: ID_COL = alt; break
+        if c=="home_win":
+            for alt in ["homeWin","home_win_flag","target","label"]:
+                if alt in df.columns: TARGET = alt; break
+drop_sub = ("score","result","win_prob","prob","implied","moneyline",
+            "odds","final","post","series","label","target","outcome")
+feat = []
+for col in df.columns:
+    lc = col.lower()
+    if col in (DATE_COL, ID_COL, TARGET): continue
+    if any(s in lc for s in drop_sub): continue
+    if "_score" in lc or lc.endswith("_w") or lc.endswith("_l"): continue
+    if pd.api.types.is_numeric_dtype(df[col]) and df[col].notna().any():
+        feat.append(col)
+keep_cols = [DATE_COL, ID_COL, TARGET] + feat
+df = df[keep_cols].copy().sort_values(DATE_COL).reset_index(drop=True)
+df.to_csv(OUT, index=False)
+print(f"[fallback] wrote {OUT} with {len(df)} rows and {len(feat)} features")
+PY
+          fi
 
-      # 3b) Upload artifacts instead of committing to the repo
-      - name: Upload raw ingest (CSV)
-        if: always()
+      # --------- SINGLE ORCHESTRATOR (pipeline.py) WITH FALLBACK ---------
+      - name: Run pipeline.py (or fallback to manual build/train)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          if [ -f "scripts/pipeline.py" ] || [ -f "pipeline.py" ]; then
+            echo ">> pipeline.py detected — running orchestrator"
+            if [ -f "scripts/pipeline.py" ]; then
+              PIPE="scripts/pipeline.py"
+            else
+              PIPE="pipeline.py"
+            fi
+
+            # Try with common flags first; if your pipeline.py has different CLI it will still run without flags.
+            if ! python "$PIPE" --base-year 2024 --run-eda --add-rolling --add-interactions 2>/dev/null; then
+              echo ">> Re-running pipeline.py without flags (using its defaults)…"
+              python "$PIPE"
+            fi
+
+            # Ensure a canonical features file exists for downstream steps/artifacts
+            if [ ! -f out/mlb_features_prepared.csv ]; then
+              found="$(ls -1 out/mlb_features_*prepared*.csv 2>/dev/null | head -n1 || true)"
+              if [ -n "$found" ]; then
+                cp "$found" out/mlb_features_prepared.csv
+              fi
+            fi
+          else
+            echo ">> No pipeline.py found — using manual build/train flow"
+            success=0
+            if python scripts/data_ingest.py --year 2025 --backfill-days 35 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
+              success=1
+            fi
+            if [ $success -eq 0 ]; then
+              if python scripts/data_ingest.py --year 2025 --backfill-days 35 --all --out out 2>/dev/null; then
+                found="$(ls -1 out/mlb_features_*prepared*.csv 2>/dev/null | head -n1 || true)"
+                if [ -n "$found" ]; then cp "$found" out/mlb_features_prepared.csv; success=1; fi
+              fi
+            fi
+            if [ $success -eq 0 ] && [ -f out/raw_games.csv ]; then
+              python scripts/feature_build.py
+              success=1
+            fi
+            if [ $success -eq 0 ]; then
+              echo "ERROR: No features CSV produced."; exit 2
+            fi
+
+            python scripts/model_train_allinone.py \
+              --data "out/mlb_features_prepared.csv" \
+              --date-col game_date \
+              --id-col game_pk \
+              --target home_win \
+              --outdir "model_all_ts" \
+              --topk 25 \
+              --threshold-strategy f1 \
+              --add-rolling \
+              --add-interactions \
+              --calibration isotonic \
+              --walkforward ts \
+              --n-splits 6
+          fi
+
+      - name: Upload artifacts (reports + datasets)
         uses: actions/upload-artifact@v4
         with:
-          name: raw_games.csv
-          path: out/raw_games.csv
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Upload prepared features (CSV)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mlb_features_prepared.csv
-          path: out/mlb_features_prepared.csv
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Upload model outputs and report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: model_all_ts
-          path: |
-            model_all_ts/**
-            model_all_ts/*.png
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Upload logs (helpful for debugging)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-and-metrics
-          path: |
-            model_all_ts/**/*.csv
-            model_all_ts/**/*.txt
-            out/**/*.txt
+          name: mlb-artifacts
           if-no-files-found: warn
           retention-days: 14
+          path: |
+            out/**
+            eda_out/**/*
+            eda_out_plus/**/*
+            model_out/**/*
+            model_all_ts/**/*
 
-      # Email notifications (uses your existing SMTP secrets)
+      - name: Commit results (if changed)
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "CI: ingest + feature prep + retrain (auto)"
+            git push
+          fi
+
       - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
@@ -144,7 +200,6 @@ jobs:
               <li><b>Commit:</b> ${{ github.sha }}</li>
               <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
-            <p>Artifacts uploaded: raw_games.csv, mlb_features_prepared.csv, model_all_ts/</p>
 
       - name: Send failure email
         if: failure()
@@ -160,4 +215,4 @@ jobs:
           secure: true
           html_body: |
             <h2>MLB pipeline run failed</h2>
-            <p>Check the run logs and downloaded artifacts (logs-and-metrics) for details.</p>
+            <p>Check the Actions logs for the failing step.</p>
