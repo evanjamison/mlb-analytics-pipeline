@@ -23,6 +23,63 @@ _pb_cache.enable()
 # ---------------------------
 # Helpers
 # ---------------------------
+
+# ---- Robust Statcast wrapper (handles malformed CSV / HTML / empties)
+import io, time
+from typing import Optional
+from urllib.error import HTTPError
+from pybaseball import statcast as _statcast
+
+def statcast_safe(start_dt: str, end_dt: str, *, max_tries: int = 4, base_sleep: float = 1.0) -> pd.DataFrame:
+    """
+    Calls pybaseball.statcast with retries and fallbacks.
+    - retries the window a few times
+    - if still failing, queries day-by-day and concatenates good days
+    - never raises ParserError; returns empty DataFrame on final failure
+    """
+    last_err: Optional[Exception] = None
+
+    # quick retries on the full window
+    for i in range(max_tries):
+        try:
+            df = _statcast(start_dt=start_dt, end_dt=end_dt)
+            if df is None:
+                raise ValueError("statcast() returned None")
+            # Sometimes pybaseball returns non-DataFrame (rare); normalize just in case
+            if not isinstance(df, pd.DataFrame):
+                try:
+                    return pd.read_csv(io.StringIO(str(df)), on_bad_lines='skip')
+                except Exception as e:
+                    last_err = e
+                    raise
+            return df
+        except Exception as e:
+            last_err = e
+            time.sleep(base_sleep * (i + 1))
+
+    # fallback: split by single days to bypass a bad daily CSV
+    try:
+        start = pd.to_datetime(start_dt)
+        end   = pd.to_datetime(end_dt)
+        chunks = []
+        for d in pd.date_range(start, end, freq="D"):
+            s = d.strftime("%Y-%m-%d")
+            t = (d + pd.Timedelta(days=0)).strftime("%Y-%m-%d")
+            try:
+                day = _statcast(start_dt=s, end_dt=t)
+                if isinstance(day, pd.DataFrame) and not day.empty:
+                    chunks.append(day)
+            except Exception:
+                # skip bad day
+                pass
+        if chunks:
+            return pd.concat(chunks, ignore_index=True, sort=False)
+    except Exception as e:
+        last_err = e
+
+    print(f"[statcast_safe] giving up for {start_dt}..{end_dt}: {last_err}")
+    return pd.DataFrame()
+
 def _retry(fn, *args, tries=3, delay=0.5, **kwargs):
     for i in range(tries):
         try:
@@ -112,7 +169,7 @@ def statcast_window_agg(end_date_str: str, window_days: int = 60) -> pd.DataFram
     end = pd.to_datetime(end_date_str).date()
     start = (end - timedelta(days=window_days - 1)).strftime("%Y-%m-%d")
     stop = (end - timedelta(days=1)).strftime("%Y-%m-%d")
-    sc = statcast(start_dt=start, end_dt=stop)
+    sc = statcast_safe(start_dt=start, end_dt=stop)
     if sc is None or sc.empty:
         return pd.DataFrame(columns=['batter', 'p_throws', 'woba_value', 'woba_denom'])
     agg = (sc.groupby(['batter', 'p_throws'], as_index=False)[['woba_value', 'woba_denom']]
@@ -200,7 +257,9 @@ def add_lineup_woba_season_features(
         return df
 
     # ----- One Statcast pull for the season-to-date window
-    sc = statcast(start_dt=season_start, end_dt=end_for_pull)
+    # sc = statcast(start_dt=season_start, end_dt=end_for_pull)
+    sc = statcast_safe(start_dt=season_start, end_dt=end_for_pull)
+
     if sc is None or sc.empty:
         df['home_lineup_woba_vsHand_season'] = np.nan
         df['away_lineup_woba_vsHand_season'] = np.nan
@@ -839,7 +898,9 @@ def add_bullpen_rolling_features(
             continue
 
         # Pull once for the whole window
-        sc = statcast(start_dt=start, end_dt=stop)
+        # sc = statcast(start_dt=start, end_dt=stop)
+        sc = statcast_safe(start_dt=start, end_dt=stop)
+
         if sc is None or sc.empty:
             for i in idx:
                 h_ip[i]=0.0; a_ip[i]=0.0; h_xf[i]=np.nan; a_xf[i]=np.nan
@@ -956,7 +1017,9 @@ def add_bullpen_season_xfip_features(
         return df
 
     # One Statcast pull for the season-to-date window
-    sc = statcast(start_dt=season_start, end_dt=end_for_pull)
+    # sc = statcast(start_dt=season_start, end_dt=end_for_pull)
+    sc = statcast_safe(start_dt=season_start, end_dt=end_for_pull)
+
     if sc is None or sc.empty:
         df['home_BP_xFIP_season'] = np.nan
         df['away_BP_xFIP_season'] = np.nan
@@ -1297,7 +1360,9 @@ def add_bullpen_rest_snapshots(
 
     # Helper to compute team bullpen IP in an arbitrary [start, stop] date range
     def _bp_ip_range(start: str, stop: str) -> pd.DataFrame:
-        sc = statcast(start_dt=start, end_dt=stop)
+        # sc = statcast(start_dt=start, end_dt=stop)
+        sc = statcast_safe(start_dt=start, end_dt=stop)
+
         if sc is None or sc.empty:
             return pd.DataFrame(columns=['pitcher_team', 'IP'])
         keep = ['game_pk', 'home_team', 'away_team', 'inning_topbot', 'pitcher', 'events', 'bb_type']
@@ -1636,7 +1701,14 @@ def add_lineup_quality_extras(games: pd.DataFrame, pa_window_days: int = 7, top_
     def _pa_window(end_date):
         start = (end_date - timedelta(days=pa_window_days)).strftime('%Y-%m-%d')
         stop  = (end_date - timedelta(days=1)).strftime('%Y-%m-%d')
-        sc = statcast(start_dt=start, end_dt=stop)
+        sc = statcast_safe(start_dt=start, end_dt=stop)
+        # top-60 window aggregate
+        agg60 = statcast_safe(df['game_date'].max().strftime('%Y-%m-%d'), 60)  # keep your logic; if you used (end, 60) rewrite to use start/stop pair:
+        # Example if you meant a 60d window ending at max date:
+        _end = pd.to_datetime(df['game_date'].max()).date()
+        _start = (_end - pd.Timedelta(days=59)).strftime("%Y-%m-%d")
+        _stop  = _end.strftime("%Y-%m-%d")
+        agg60 = statcast_safe(start_dt=_start, end_dt=_stop)
         if sc is None or sc.empty:
             return pd.DataFrame(columns=['batter','PA'])
         g = sc.groupby('batter', as_index=False)['woba_denom'].sum().rename(columns={'woba_denom':'PA'})
@@ -1772,7 +1844,16 @@ def add_park_hr_factor(games: pd.DataFrame, season_start: str | None = None, pri
         df['Park_HRFactor_season'] = np.nan
         return df
 
-    sc = statcast(start_dt=season_start, end_dt=end_for_pull)
+    # sc = statcast(start_dt=season_start, end_dt=end_for_pull)
+    sc = statcast_safe(start_dt=season_start, end_dt=end_for_pull)
+    # top-60 window aggregate
+    agg60 = statcast_safe(df['game_date'].max().strftime('%Y-%m-%d'), 60)  # keep your logic; if you used (end, 60) rewrite to use start/stop pair:
+    # Example if you meant a 60d window ending at max date:
+    _end = pd.to_datetime(df['game_date'].max()).date()
+    _start = (_end - pd.Timedelta(days=59)).strftime("%Y-%m-%d")
+    _stop  = _end.strftime("%Y-%m-%d")
+    agg60 = statcast_safe(start_dt=_start, end_dt=_stop)
+
     if sc is None or sc.empty:
         df['Park_HRFactor_season'] = np.nan
         return df
