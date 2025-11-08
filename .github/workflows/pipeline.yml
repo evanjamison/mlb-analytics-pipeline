@@ -50,18 +50,22 @@ jobs:
       - name: Ensure fallback feature builder exists (only used if your ingest doesn't create features)
         shell: bash
         run: |
+          set -e
           mkdir -p scripts out
           if [ ! -f scripts/feature_build.py ]; then
             cat > scripts/feature_build.py <<'PY'
 import os, pandas as pd, numpy as np
+
 RAW = "out/raw_games.csv"
 OUT = "out/mlb_features_prepared.csv"
-DATE_COL = "game_date"
-ID_COL = "game_pk"
-TARGET = "home_win"
+DATE_COL, ID_COL, TARGET = "game_date","game_pk","home_win"
+
 if not os.path.exists(RAW):
     raise SystemExit(f"fallback builder: {RAW} not found")
+
 df = pd.read_csv(RAW, low_memory=False)
+
+# Try to map common alt column names
 for c in [DATE_COL, ID_COL, TARGET]:
     if c not in df.columns:
         if c=="game_date":
@@ -73,18 +77,24 @@ for c in [DATE_COL, ID_COL, TARGET]:
         if c=="home_win":
             for alt in ["homeWin","home_win_flag","target","label"]:
                 if alt in df.columns: TARGET = alt; break
+
 drop_sub = ("score","result","win_prob","prob","implied","moneyline",
             "odds","final","post","series","label","target","outcome")
-feat = []
+
+feat=[]
 for col in df.columns:
     lc = col.lower()
-    if col in (DATE_COL, ID_COL, TARGET): continue
-    if any(s in lc for s in drop_sub): continue
-    if "_score" in lc or lc.endswith("_w") or lc.endswith("_l"): continue
+    if col in (DATE_COL, ID_COL, TARGET): 
+        continue
+    if any(s in lc for s in drop_sub): 
+        continue
+    if "_score" in lc or lc.endswith("_w") or lc.endswith("_l"):
+        continue
     if pd.api.types.is_numeric_dtype(df[col]) and df[col].notna().any():
         feat.append(col)
-keep_cols = [DATE_COL, ID_COL, TARGET] + feat
-df = df[keep_cols].copy().sort_values(DATE_COL).reset_index(drop=True)
+
+keep = [DATE_COL, ID_COL, TARGET] + feat
+df = df[keep].sort_values(DATE_COL).reset_index(drop=True)
 df.to_csv(OUT, index=False)
 print(f"[fallback] wrote {OUT} with {len(df)} rows and {len(feat)} features")
 PY
