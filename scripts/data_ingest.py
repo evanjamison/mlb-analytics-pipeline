@@ -1940,11 +1940,16 @@ def _ingest_year_to_raw(
     out_path: str = "out/raw_games.csv",
     include_finished: bool = True,
     fetch_handedness: bool = True,
+    max_workers: int = 20,
 ) -> tuple[str, str]:
     """
-    Fetches schedule+probables for the given YEAR, including a warmup window
-    that starts `backfill_days` before Jan 1, then merges/dedupes into out/raw_games.csv.
-    Returns (start_date, end_date) actually used for the year.
+    Fetch schedule+probables for the given YEAR, including a warmup window that
+    starts `backfill_days` before Jan 1. Merge & dedupe into `out/raw_games.csv`.
+    Keeps only rows within [year_start - backfill_days, Dec 31 year].
+    Returns (year_start_str, year_end_str) for downstream feature building.
+
+    Requires your file to define:
+      fetch_games_with_probables_statsapi_fast(start_date, end_date, include_finished, fetch_handedness, max_workers, debug)
     """
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
@@ -1955,43 +1960,193 @@ def _ingest_year_to_raw(
     start_date = warmup_start.strftime("%Y-%m-%d")
     end_date   = year_end.strftime("%Y-%m-%d")
 
+    print(f"📥 Ingesting YEAR {year} with warmup → {start_date} to {end_date}")
+
     # Pull once for the whole span (warmup → Dec 31)
-    print(f"📥 Ingesting YEAR {year} with warmup from {start_date} → {end_date}")
-    ing = fetch_games_with_probables_statsapi_fast(
+    new_df = fetch_games_with_probables_statsapi_fast(
         start_date=start_date,
         end_date=end_date,
         include_finished=include_finished,
         fetch_handedness=fetch_handedness,
-        max_workers=20,
-        debug=False
+        max_workers=max_workers,
+        debug=False,
     )
 
-    # Merge into existing raw file (dedupe on game_pk)
+    # Load existing (if any)
     if os.path.exists(out_path):
-        prev = pd.read_csv(out_path)
-        # normalize date cols
+        existing = pd.read_csv(out_path)
+        # Normalize date columns for consistent filtering/merge
         for c in ("game_date", "game_datetime"):
-            if c in prev.columns:
-                prev[c] = pd.to_datetime(prev[c], errors="coerce")
-        merged = pd.concat([prev, ing], ignore_index=True)
+            if c in existing.columns:
+                existing[c] = pd.to_datetime(existing[c], errors="coerce")
     else:
-        merged = ing.copy()
+        existing = pd.DataFrame()
 
-    if "game_pk" in merged.columns:
-        merged = (merged.sort_values(["game_pk", "game_datetime"], na_position="last")
-                        .drop_duplicates("game_pk", keep="last")
-                        .reset_index(drop=True))
+    before = len(existing)
 
-    # Keep only warmup+that year (so 2025 file doesn’t balloon with other seasons)
-    if "game_date" in merged.columns:
-        merged["game_date"] = pd.to_datetime(merged["game_date"], errors="coerce").dt.date
-        keep = (merged["game_date"] >= warmup_start) & (merged["game_date"] <= year_end)
-        merged = merged.loc[keep].copy()
+    # Merge & dedupe by game_pk
+    if not existing.empty:
+        all_df = pd.concat([existing, new_df], ignore_index=True)
+    else:
+        all_df = new_df.copy()
 
-    merged.to_csv(out_path, index=False)
-    print(f"💾 Wrote {len(merged):,} rows → {out_path}")
+    if "game_pk" in all_df.columns:
+        # Sort so the latest API record per game wins
+        sort_cols = [c for c in ["game_pk", "game_datetime"] if c in all_df.columns]
+        if sort_cols:
+            all_df = all_df.sort_values(sort_cols, na_position="last")
+        all_df = all_df.drop_duplicates(subset=["game_pk"], keep="last")
+    else:
+        all_df = all_df.drop_duplicates()
+
+    # Keep only warmup + target year rows
+    if "game_date" in all_df.columns:
+        all_df["game_date"] = pd.to_datetime(all_df["game_date"], errors="coerce").dt.date
+        mask_keep = (all_df["game_date"] >= warmup_start) & (all_df["game_date"] <= year_end)
+        all_df = all_df.loc[mask_keep].copy()
+
+    # Progress message
+    added = len(all_df) - before
+    if added <= 0:
+        print(f"[ingest] No new games to add. Total still {len(all_df):,} rows.")
+    else:
+        print(f"[ingest] {added:,} new games added (total {len(all_df):,} rows).")
+
+    # Save
+    all_df.to_csv(out_path, index=False)
+    print(f"[ingest] Saved → {out_path}")
+
     return (year_start.strftime("%Y-%m-%d"), year_end.strftime("%Y-%m-%d"))
 
+
+# ========= EXPORTS for pipeline (append to bottom of data_ingest.py) =========
+
+def build_raw_dataset_year(
+    year: int,
+    backfill_days: int = 35,
+    out_csv: str = "out/raw_games.csv",
+    include_finished: bool = True,
+    fetch_handedness: bool = True,
+    max_workers: int = 20,
+):
+    """
+    Thin wrapper around _ingest_year_to_raw that returns (start, end, out_csv).
+    Keeps your warmup window logic intact.
+    """
+    start, end = _ingest_year_to_raw(
+        year=year,
+        backfill_days=backfill_days,
+        out_path=out_csv,
+        include_finished=include_finished,
+        fetch_handedness=fetch_handedness,
+        max_workers=max_workers,
+    )
+    return start, end, out_csv
+
+
+# ========= PUBLIC FEATURE BUILDER (called by run_pipeline.py) =========
+def build_feature_table(
+    start: str,
+    end: str,
+    out_csv: str = "out/_tmp_features.csv",
+    verbose: bool = False,
+    max_workers: int = 12,
+) -> str:
+    """
+    Build a leak-safe feature table for the inclusive date window [start, end].
+    Writes CSV to `out_csv` and returns that path.
+
+    The function reuses your existing context and rolling/season blocks.
+    """
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+    if verbose:
+        print(f"[build_feature_table] window: {start} → {end}")
+        print("[build_feature_table] fetching base games from StatsAPI …")
+
+    # --- Base games for window (includes scores for finished games)
+    games = fetch_games_with_probables_statsapi_fast(
+        start_date=start,
+        end_date=end,
+        include_finished=True,
+        fetch_handedness=True,
+        max_workers=max_workers,
+        debug=False,
+    )
+    if games is None or games.empty:
+        # Write empty but valid CSV to keep the pipeline flowing
+        pd.DataFrame(columns=["game_pk", "game_date"]).to_csv(out_csv, index=False)
+        if verbose: print("[build_feature_table] no games in window; wrote empty CSV")
+        return out_csv
+
+    # =========================
+    # CONTEXT / FEATURE BLOCKS
+    # =========================
+    if verbose: print("[build_feature_table] adding context features …")
+    games = add_sp_rest_features(games)
+    games = add_bullpen_rest_snapshots(games)
+    games = add_basic_weather(games)
+    games = add_plate_umpire(games)
+    games = add_schedule_fatigue(games)
+    games = add_bullpen_highlev_and_closer(games)
+    games = add_lineup_quality_extras(games, pa_window_days=7, top_k=4)
+    games = add_park_hr_factor(games)
+    games = add_travel_schedule_load(games)
+
+    if verbose: print("[build_feature_table] lineup wOBA 15d window …")
+    games = add_lineup_woba_features(games, window_days=15)
+
+    if verbose: print("[build_feature_table] SP Statcast rolling 30d …")
+    games = add_sp_rolling_features_savant(games, window_days=30, verbose=verbose)
+    games = add_wind_interactions_and_sp_fb(games)
+
+    if verbose: print("[build_feature_table] bullpen rolling (IP & xFIP) …")
+    games = add_bullpen_rolling_features(games, window_days=30, lg_hr_per_fb=0.105, max_workers=max_workers)
+
+    if verbose: print("[build_feature_table] bullpen season-to-date xFIP …")
+    games = add_bullpen_season_xfip_features(games, season_start=None, lg_hr_per_fb=0.105)
+
+    if verbose: print("[build_feature_table] park run factor (season shrunk) …")
+    games = add_season_park_factor_features(games, prior_games=300, friendly_hi=1.005, friendly_lo=0.995)
+
+    if verbose: print("[build_feature_table] lineup wOBA season-to-date vs opp hand …")
+    games = add_lineup_woba_season_features(games, season_start=None)
+
+    if verbose: print("[build_feature_table] team rolling/Elo …")
+    games_for_rolling = games.copy()
+    games_for_rolling['game_id']   = games_for_rolling['game_pk']
+    games_for_rolling['home_team'] = games_for_rolling.get('home_abbrev', games_for_rolling['home_team_name'])
+    games_for_rolling['away_team'] = games_for_rolling.get('away_abbrev', games_for_rolling['away_team_name'])
+    games_for_rolling['game_date']  = pd.to_datetime(games_for_rolling['game_date'])
+    games_for_rolling['home_score'] = pd.to_numeric(games_for_rolling['home_score'], errors='coerce')
+    games_for_rolling['away_score'] = pd.to_numeric(games_for_rolling['away_score'], errors='coerce')
+
+    team_feats = add_team_rolling_features(
+        games_for_rolling[['game_id','game_date','home_team','away_team','home_score','away_score']].copy(),
+        last_n=10, include_elo=True, elo_K=20, elo_HFA=55
+    )
+    cols_to_keep = [
+        'game_id',
+        'Team_RunDiffpg_diff','Team_WinPct_diff','Team_LastN_WinPct_diff','Team_Elo_diff',
+        'Home_STG_RunDiffpg','Away_STG_RunDiffpg','Home_STG_WinPct','Away_STG_WinPct',
+        'Home_LastN_WinPct','Away_LastN_WinPct'
+    ]
+    games_all = games.merge(team_feats[cols_to_keep], left_on='game_pk', right_on='game_id', how='left')
+
+    # Final curated interactions (uses only pre-game inputs)
+    final_df = add_interaction_features(games_all)
+
+    # Persist
+    # Normalize datetimes for stable CSV
+    for col in ['game_date', 'game_datetime']:
+        if col in final_df.columns:
+            final_df[col] = pd.to_datetime(final_df[col], errors='coerce')
+    final_df.to_csv(out_csv, index=False)
+    if verbose:
+        print(f"[build_feature_table] wrote {len(final_df):,} rows × {final_df.shape[1]} cols → {out_csv}")
+    return out_csv
+
+# Optional alias so other code names still work
+build_features = build_feature_table
 
 # =============================================================================
 # MAIN
