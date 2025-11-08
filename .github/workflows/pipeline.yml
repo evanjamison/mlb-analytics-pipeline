@@ -1,12 +1,11 @@
 name: pipeline
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ main, master ]
-  workflow_dispatch: {}        # enables the "Run workflow" button
+    branches: [main, master]
   schedule:
-    - cron: "15 8 * * *"       # optional: daily @ 08:15 UTC
-
+    - cron: '15 8 * * *'  # optional
 permissions:
   contents: read
 
@@ -61,16 +60,19 @@ jobs:
 
             # Raw fallback features (very slim) - only if prepare/model need something to chew on
             python - <<'PY'
-import os, pandas as pd
-RAW = "out/raw_games.csv"
-if not os.path.exists(RAW):
-    raise SystemExit("No raw_games.csv - cannot fallback. Add scripts/run_pipeline.py instead.")
-df = pd.read_csv(RAW)
-keep = ['game_date','game_pk','home_win']
-df = df[[c for c in keep if c in df.columns]]
-df.to_csv("out/mlb_features_combined.csv", index=False)
-print("[fallback] wrote out/mlb_features_combined.csv")
-PY
+            import os
+            import pandas as pd
+
+            RAW = "out/raw_games.csv"
+            if not os.path.exists(RAW):
+                raise SystemExit("No raw_games.csv - cannot fallback. Add scripts/run_pipeline.py instead.")
+
+            df = pd.read_csv(RAW)
+            keep = ['game_date','game_pk','home_win']
+            df = df[[c for c in keep if c in df.columns]]
+            df.to_csv("out/mlb_features_combined.csv", index=False)
+            print("[fallback] wrote out/mlb_features_combined.csv")
+            PY
 
             # EDA (best-effort)
             if [[ -f scripts/eda_scaffold.py ]]; then
@@ -94,3 +96,4 @@ PY
               --calibration isotonic --walkforward monthly --n-splits 6 \
               --min-edge 0.02 --kelly-cap 0.05
           fi
+
