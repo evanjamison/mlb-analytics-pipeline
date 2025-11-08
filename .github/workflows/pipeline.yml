@@ -3,8 +3,7 @@ name: MLB daily update & retrain
 on:
   workflow_dispatch: {}
   schedule:
-    # 09:15 AM Pacific (Standard Time) == 17:15 UTC
-    - cron: "15 17 * * *"
+    - cron: "15 17 * * *"  # 09:15 PT / 17:15 UTC daily
 
 permissions:
   contents: write
@@ -53,54 +52,55 @@ jobs:
           set -e
           mkdir -p scripts out
           if [ ! -f scripts/feature_build.py ]; then
-            cat > scripts/feature_build.py <<'PY'
-import os, pandas as pd, numpy as np
+            # NOTE: The Python below is TAB-indented on purpose. Don't convert tabs to spaces.
+            cat > scripts/feature_build.py <<-'PY'
+            	import os, pandas as pd, numpy as np
+            	RAW = "out/raw_games.csv"
+            	OUT = "out/mlb_features_prepared.csv"
+            	DATE_COL = "game_date"
+            	ID_COL = "game_pk"
+            	TARGET = "home_win"
 
-RAW = "out/raw_games.csv"
-OUT = "out/mlb_features_prepared.csv"
-DATE_COL, ID_COL, TARGET = "game_date","game_pk","home_win"
+            	if not os.path.exists(RAW):
+            		raise SystemExit(f"[fallback builder] not found: {RAW}")
 
-if not os.path.exists(RAW):
-    raise SystemExit(f"fallback builder: {RAW} not found")
+            	df = pd.read_csv(RAW, low_memory=False)
 
-df = pd.read_csv(RAW, low_memory=False)
+            	# Try to normalize expected columns
+            	if DATE_COL not in df.columns:
+            		for alt in ["date","gameDate","game_datetime","start_date"]:
+            			if alt in df.columns: DATE_COL = alt; break
+            	if ID_COL not in df.columns:
+            		for alt in ["game_id","id","gamePk"]:
+            			if alt in df.columns: ID_COL = alt; break
+            	if TARGET not in df.columns:
+            		for alt in ["homeWin","home_win_flag","target","label"]:
+            			if alt in df.columns: TARGET = alt; break
 
-# Try to map common alt column names
-for c in [DATE_COL, ID_COL, TARGET]:
-    if c not in df.columns:
-        if c=="game_date":
-            for alt in ["date","gameDate","game_datetime","start_date"]:
-                if alt in df.columns: DATE_COL = alt; break
-        if c=="game_pk":
-            for alt in ["game_id","id","gamePk"]:
-                if alt in df.columns: ID_COL = alt; break
-        if c=="home_win":
-            for alt in ["homeWin","home_win_flag","target","label"]:
-                if alt in df.columns: TARGET = alt; break
+            	drop_sub = (
+            		"score","result","win_prob","prob","implied","moneyline",
+            		"odds","final","post","series","label","target","outcome"
+            	)
 
-drop_sub = ("score","result","win_prob","prob","implied","moneyline",
-            "odds","final","post","series","label","target","outcome")
+            	feat = []
+            	for col in df.columns:
+            		lc = str(col).lower()
+            		if col in (DATE_COL, ID_COL, TARGET):
+            			continue
+            		if any(s in lc for s in drop_sub):
+            			continue
+            		if "_score" in lc or lc.endswith("_w") or lc.endswith("_l"):
+            			continue
+            		if pd.api.types.is_numeric_dtype(df[col]) and df[col].notna().any():
+            			feat.append(col)
 
-feat=[]
-for col in df.columns:
-    lc = col.lower()
-    if col in (DATE_COL, ID_COL, TARGET): 
-        continue
-    if any(s in lc for s in drop_sub): 
-        continue
-    if "_score" in lc or lc.endswith("_w") or lc.endswith("_l"):
-        continue
-    if pd.api.types.is_numeric_dtype(df[col]) and df[col].notna().any():
-        feat.append(col)
-
-keep = [DATE_COL, ID_COL, TARGET] + feat
-df = df[keep].sort_values(DATE_COL).reset_index(drop=True)
-df.to_csv(OUT, index=False)
-print(f"[fallback] wrote {OUT} with {len(df)} rows and {len(feat)} features")
-PY
+            	keep_cols = [DATE_COL, ID_COL, TARGET] + feat
+            	df = df[keep_cols].copy().sort_values(DATE_COL).reset_index(drop=True)
+            	df.to_csv(OUT, index=False)
+            	print(f"[fallback] wrote {OUT} with {len(df)} rows and {len(feat)} features")
+            PY
           fi
 
-      # -------------- SINGLE ORCHESTRATOR STEP --------------
       - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
         shell: bash
         run: |
@@ -113,25 +113,30 @@ PY
               --add-rolling \
               --add-interactions
           else
-            echo ">> No orchestrator found — using existing manual build/train flow"
+            echo ">> No orchestrator found — using manual build/train flow"
             mkdir -p out
             success=0
+
             if python scripts/data_ingest.py --year 2025 --backfill-days 35 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
               success=1
             fi
+
             if [ $success -eq 0 ]; then
               if python scripts/data_ingest.py --year 2025 --backfill-days 35 --all --out out 2>/dev/null; then
                 found="$(ls -1 out/mlb_features_*prepared*.csv 2>/dev/null | head -n1 || true)"
                 if [ -n "$found" ]; then cp "$found" out/mlb_features_prepared.csv; success=1; fi
               fi
             fi
+
             if [ $success -eq 0 ] && [ -f out/raw_games.csv ]; then
               python scripts/feature_build.py
               success=1
             fi
+
             if [ $success -eq 0 ]; then
               echo "ERROR: No features CSV produced."; exit 2
             fi
+
             python scripts/model_train_allinone.py \
               --data "out/mlb_features_prepared.csv" \
               --date-col game_date \
@@ -147,7 +152,6 @@ PY
               --n-splits 6
           fi
 
-      # -------------- UPLOAD ARTIFACTS --------------
       - name: Upload artifacts (reports + datasets)
         uses: actions/upload-artifact@v4
         with:
@@ -161,7 +165,6 @@ PY
             model_out/**/*
             model_all_ts/**/*
 
-      # -------------- COMMIT RESULTS --------------
       - name: Commit results (if changed)
         shell: bash
         run: |
@@ -175,7 +178,6 @@ PY
             git push
           fi
 
-      # -------------- EMAIL ALERTS --------------
       - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
