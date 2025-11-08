@@ -17,13 +17,18 @@ Outputs
 - model_all_ts/                          (reports, figs, and CSVs from model_train_allinone)
 """
 
-import argparse, os, sys, inspect
+import argparse, os, sys, inspect, platform
 from datetime import datetime, timedelta, date
 from pathlib import Path
 import importlib
 import pandas as pd
 import numpy as np
-import platform
+
+# ---------------- PATHS ----------------
+SCRIPT_DIR = Path(__file__).resolve().parent
+EDA_DEFAULT      = str((SCRIPT_DIR / "eda_scaffold.py").resolve())
+PREP_DEFAULT     = str((SCRIPT_DIR / "prepare_features.py").resolve())
+MODEL_DEFAULT    = str((SCRIPT_DIR / "model_train_allinone.py").resolve())
 
 # ---------------- utils ----------------
 def ensure_dir(p: str) -> str:
@@ -46,7 +51,6 @@ def max_game_date(df: pd.DataFrame, date_col: str) -> date | None:
     return None if s.isna().all() else s.max()
 
 def safe_today() -> date:
-    # use UTC today; change to -1 day if you want to avoid partial same-day games
     return datetime.utcnow().date()
 
 def call_if_accepts(fn, **kwargs):
@@ -65,12 +69,7 @@ def fallback_build_features_from_raw(
     raw_csv: str, out_csv: str, date_col: str, id_col: str, target: str,
     start_date: str, end_date: str
 ) -> str:
-    """
-    Build a minimal, leak-safe feature set directly from raw_games.csv.
-    - Keeps {date_col,id_col,target} + numeric features w/ data.
-    - Drops obvious leakage columns (odds/scores/results/etc.).
-    - Filters to [start_date, end_date].
-    """
+    """Minimal, leak-safe feature builder for fallback mode."""
     if not os.path.exists(raw_csv):
         raise RuntimeError(f"[fallback] raw file missing: {raw_csv}")
 
@@ -89,36 +88,33 @@ def fallback_build_features_from_raw(
     mask = (dt >= pd.to_datetime(start_date)) & (dt <= pd.to_datetime(end_date))
     df = df.loc[mask].copy()
 
-    # try to ensure id/target exist
+    # ensure id/target exist
     if id_col not in df.columns:
         for alt in ["game_id", "gamePk", "id"]:
             if alt in df.columns: id_col = alt; break
     if id_col not in df.columns:
-        # fabricate a stable id if truly missing
         df[id_col] = np.arange(len(df))
 
     if target not in df.columns:
-        # best-effort target from scores if available
+        # derive target from scores if possible
         h, a = None, None
         for cand in ["home_score", "homeFinal", "home_runs", "homeRuns"]:
             if cand in df.columns: h = cand; break
         for cand in ["away_score", "awayFinal", "away_runs", "awayRuns"]:
             if cand in df.columns: a = cand; break
         if h and a:
-            df[target] = (pd.to_numeric(df[h], errors="coerce") > pd.to_numeric(df[a], errors="coerce")).astype(int)
+            df[target] = (pd.to_numeric(df[h], errors="coerce") >
+                          pd.to_numeric(df[a], errors="coerce")).astype(int)
         else:
-            raise RuntimeError(f"[fallback] target '{target}' not found and cannot be derived from scores.")
+            raise RuntimeError(f"[fallback] target '{target}' not found or derivable.")
 
     # select leak-safe numeric features
     feats = []
     for c in df.columns:
         lc = c.lower()
-        if c in (date_col, id_col, target):
-            continue
-        if any(s in lc for s in LEAK_SUBSTR):
-            continue
-        if "_score" in lc or lc.endswith("_w") or lc.endswith("_l"):
-            continue
+        if c in (date_col, id_col, target): continue
+        if any(s in lc for s in LEAK_SUBSTR): continue
+        if "_score" in lc or lc.endswith("_w") or lc.endswith("_l"): continue
         if pd.api.types.is_numeric_dtype(df[c]) and df[c].notna().any():
             feats.append(c)
 
@@ -131,7 +127,6 @@ def fallback_build_features_from_raw(
 
 # ---------------- main ----------------
 def main(a):
-    # IO dirs
     ensure_dir(os.path.dirname(a.raw) or ".")
     ensure_dir(os.path.dirname(a.features_combined) or ".")
     ensure_dir(os.path.dirname(a.prepared) or ".")
@@ -146,7 +141,6 @@ def main(a):
     y0, y1 = a.base_year, update_to.year
     print(f"\n== RAW INGEST: ensuring years {y0}..{y1} are present in {a.raw} ==")
 
-    # Prefer your _ingest_year_to_raw if it exists; otherwise just skip (assume you create raw elsewhere)
     ingest_fn = getattr(data_ingest, "_ingest_year_to_raw", None)
     if ingest_fn is not None:
         for y in range(y0, y1 + 1):
@@ -160,14 +154,14 @@ def main(a):
                 max_workers=a.max_workers,
             )
     else:
-        print("[warn] data_ingest._ingest_year_to_raw not found — skipping raw refresh (expect raw already on disk).")
+        print("[warn] data_ingest._ingest_year_to_raw not found — skipping raw refresh.")
 
     raw_df = read_csv_safe(a.raw, parse_dates=["game_date", "game_datetime"])
     if raw_df.empty:
         print("!! No raw data available after ingest; aborting.")
         sys.exit(2)
 
-    # ---------- 1) Compute span to (re)build features ----------
+    # ---------- 1) Compute span ----------
     combined_df = read_csv_safe(a.features_combined, parse_dates=[a.date_col])
     prev_end = max_game_date(combined_df, a.date_col)
     if prev_end is None:
@@ -180,11 +174,11 @@ def main(a):
         )
         print(f"[span] Combined through {prev_end}; building NEW from {start_build} → {update_to} (warmup {a.feature_backfill_days}d)")
 
+    # ---------- 2) Build features ----------
     if start_build > update_to:
         print("[span] Nothing new to build.")
         new_csv = None
     else:
-        # ---------- 2) Build features for span (real builder if available; else fallback) ----------
         tmp_new_csv = os.path.join("out", f"_tmp_features_{start_build}_to_{update_to}.csv").replace(":", "-")
         ensure_dir("out")
 
@@ -218,15 +212,9 @@ def main(a):
                 out=tmp_new_csv,
                 verbose=True,
             )
-            # Some builders return a path; if so, use it
-            if isinstance(ret, (list, tuple)) and len(ret) > 0 and isinstance(ret[-1], str):
-                new_csv = ret[-1]
-            elif isinstance(ret, str) and os.path.exists(ret):
-                new_csv = ret
-            else:
-                new_csv = tmp_new_csv  # trust our requested output
+            new_csv = ret[-1] if isinstance(ret, (list, tuple)) and ret else tmp_new_csv
 
-    # ---------- 3) Append/dedupe into combined ----------
+    # ---------- 3) Combine ----------
     if new_csv and os.path.exists(new_csv):
         new_feat = read_csv_safe(new_csv, parse_dates=[a.date_col])
         if prev_end is not None and not new_feat.empty:
@@ -248,17 +236,21 @@ def main(a):
     else:
         print("[combine] No new feature CSV produced; keeping existing combined as-is.")
 
-    # ---------- 4) EDA (optional) ----------
+    # ---------- 4) EDA ----------
+    print(f"[paths] eda={a.eda_script}")
+    print(f"[paths] prepare={a.prepare_script}")
+    print(f"[paths] model={a.model_script}")
+
     if a.run_eda:
         print("\n== EDA ==")
-        cmd = f'{a.pybin} {a.eda_script} --data "{a.features_combined}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
+        cmd = f'{a.pybin} "{a.eda_script}" --data "{a.features_combined}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
         print("[exec]", cmd)
         if os.system(cmd) != 0:
             print("!! EDA failed (continuing).")
 
     # ---------- 5) Prepare features ----------
     print("\n== PREPARE FEATURES ==")
-    cmd = f'{a.pybin} {a.prepare_script} --in "{a.features_combined}" --out "{a.prepared}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
+    cmd = f'{a.pybin} "{a.prepare_script}" --in "{a.features_combined}" --out "{a.prepared}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
     print("[exec]", cmd)
     if os.system(cmd) != 0:
         print("!! prepare_features failed.")
@@ -284,7 +276,7 @@ def main(a):
         f'--min-edge {a.min_edge:.3f}',
         f'--kelly-cap {a.kelly_cap:.3f}',
     ]
-    cmd = f'{a.pybin} {a.model_script} ' + " ".join([t for t in train_args if t])
+    cmd = f'{a.pybin} "{a.model_script}" ' + " ".join([t for t in train_args if t])
     print("[exec]", cmd)
     if os.system(cmd) != 0:
         print("!! model_train_allinone failed.")
@@ -314,15 +306,14 @@ if __name__ == "__main__":
     # Backfills
     ap.add_argument("--ingest-backfill-days", type=int, default=35)
     ap.add_argument("--feature-backfill-days", type=int, default=35)
-    # Concurrency hint for ingest
+    # Concurrency
     ap.add_argument("--max-workers", type=int, default=20)
-    # Script paths/binaries
+    # Script paths / binaries
     default_pybin = "python" if platform.system().lower() != "windows" else "py"
-    ap.add_argument("--pybin", default=default_pybin)  # auto: 'python' on Linux/Mac, 'py' on Windows
-
-    ap.add_argument("--eda-script", default="eda_scaffold.py")
-    ap.add_argument("--prepare-script", default="prepare_features.py")
-    ap.add_argument("--model-script", default="model_train_allinone.py")
+    ap.add_argument("--pybin", default=default_pybin)
+    ap.add_argument("--eda-script", default=EDA_DEFAULT)
+    ap.add_argument("--prepare-script", default=PREP_DEFAULT)
+    ap.add_argument("--model-script", default=MODEL_DEFAULT)
     ap.add_argument("--run-eda", action="store_true")
     # Modeling knobs
     ap.add_argument("--topk", type=int, default=25)
