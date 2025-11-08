@@ -3,8 +3,10 @@ name: MLB daily update & retrain
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "15 17 * * *"  # 09:15 PT / 17:15 UTC daily
+    # 09:15 AM Pacific (Standard Time) == 17:15 UTC
+    - cron: "15 17 * * *"
 
+# Needed so the action can push updated artifacts (out/*) back to the repo
 permissions:
   contents: write
 
@@ -30,7 +32,9 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           FAILED_REQ=0
           if [ -f "requirements.txt" ]; then
-            if ! pip install -r requirements.txt ; then FAILED_REQ=1; fi
+            if ! pip install -r requirements.txt ; then
+              FAILED_REQ=1
+            fi
           else
             FAILED_REQ=1
           fi
@@ -41,22 +45,26 @@ jobs:
               "catboost>=1.2.5" "statsmodels>=0.14" "requests>=2.31" \
               "tqdm>=4.66" pybaseball mlb-statsapi
           else
+            # keep statsapi fresh if you use it in your script
             pip install --upgrade mlb-statsapi || true
           fi
 
-      # ---- Removed the heredoc that was writing scripts/feature_build.py ----
+      # ---- We removed the heredoc fallback builder; your repo/orchestrator provides features ----
       - name: Skip fallback feature builder (not needed)
         shell: bash
         run: |
           echo "Skipping fallback builder. Your repo/orchestrator provides features."
 
+      # ---- Unified orchestrator with safe manual fallback ----
       - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
         shell: bash
         run: |
           set -euo pipefail
+
           if [ -f "scripts/run_pipeline.py" ]; then
             echo ">> scripts/run_pipeline.py detected — running orchestrator"
             python scripts/run_pipeline.py \
+              --pybin python \
               --base-year 2024 \
               --run-eda \
               --add-rolling \
@@ -66,10 +74,12 @@ jobs:
             mkdir -p out
             success=0
 
+            # Try your data_ingest feature builder (A)
             if python scripts/data_ingest.py --year 2025 --backfill-days 35 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
               success=1
             fi
 
+            # Try “all” mode that writes to ./out (B)
             if [ $success -eq 0 ]; then
               if python scripts/data_ingest.py --year 2025 --backfill-days 35 --all --out out 2>/dev/null; then
                 found="$(ls -1 out/mlb_features_*prepared*.csv 2>/dev/null | head -n1 || true)"
@@ -77,15 +87,13 @@ jobs:
               fi
             fi
 
-            if [ $success -eq 0 ] && [ -f out/raw_games.csv ]; then
-              echo "WARNING: raw dataset exists but no feature file; please add a builder script."
+            # Hard fail if your ingest didn't emit features (we removed the legacy fallback)
+            if [ $success -eq 0 ]; then
+              echo "ERROR: No features CSV produced by data_ingest. Ensure it writes ./out/mlb_features_prepared.csv"
               exit 2
             fi
 
-            if [ $success -eq 0 ]; then
-              echo "ERROR: No features CSV produced."; exit 2
-            fi
-
+            # Train
             python scripts/model_train_allinone.py \
               --data "out/mlb_features_prepared.csv" \
               --date-col game_date \
@@ -101,6 +109,7 @@ jobs:
               --n-splits 6
           fi
 
+      # ---- Upload artifacts so you can download from the Actions run ----
       - name: Upload artifacts (reports + datasets)
         uses: actions/upload-artifact@v4
         with:
@@ -114,6 +123,7 @@ jobs:
             model_out/**/*
             model_all_ts/**/*
 
+      # ---- Commit any changed outputs back to the repo (optional) ----
       - name: Commit results (if changed)
         shell: bash
         run: |
@@ -127,6 +137,7 @@ jobs:
             git push
           fi
 
+      # ---- Email alerts (requires your SMTP secrets set) ----
       - name: Send success email
         if: success()
         uses: dawidd6/action-send-mail@v3
@@ -164,4 +175,5 @@ jobs:
           html_body: |
             <h2>MLB pipeline run failed</h2>
             <p>Check the Actions logs for the failing step.</p>
+
 
