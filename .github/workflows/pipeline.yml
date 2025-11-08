@@ -30,9 +30,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           FAILED_REQ=0
           if [ -f "requirements.txt" ]; then
-            if ! pip install -r requirements.txt ; then
-              FAILED_REQ=1
-            fi
+            if ! pip install -r requirements.txt ; then FAILED_REQ=1; fi
           else
             FAILED_REQ=1
           fi
@@ -46,60 +44,11 @@ jobs:
             pip install --upgrade mlb-statsapi || true
           fi
 
-      - name: Ensure fallback feature builder exists (only used if your ingest doesn't create features)
+      # ---- Removed the heredoc that was writing scripts/feature_build.py ----
+      - name: Skip fallback feature builder (not needed)
         shell: bash
         run: |
-          set -e
-          mkdir -p scripts out
-          if [ ! -f scripts/feature_build.py ]; then
-            # NOTE: The Python below is TAB-indented on purpose. Don't convert tabs to spaces.
-            cat > scripts/feature_build.py <<-'PY'
-            	import os, pandas as pd, numpy as np
-            	RAW = "out/raw_games.csv"
-            	OUT = "out/mlb_features_prepared.csv"
-            	DATE_COL = "game_date"
-            	ID_COL = "game_pk"
-            	TARGET = "home_win"
-
-            	if not os.path.exists(RAW):
-            		raise SystemExit(f"[fallback builder] not found: {RAW}")
-
-            	df = pd.read_csv(RAW, low_memory=False)
-
-            	# Try to normalize expected columns
-            	if DATE_COL not in df.columns:
-            		for alt in ["date","gameDate","game_datetime","start_date"]:
-            			if alt in df.columns: DATE_COL = alt; break
-            	if ID_COL not in df.columns:
-            		for alt in ["game_id","id","gamePk"]:
-            			if alt in df.columns: ID_COL = alt; break
-            	if TARGET not in df.columns:
-            		for alt in ["homeWin","home_win_flag","target","label"]:
-            			if alt in df.columns: TARGET = alt; break
-
-            	drop_sub = (
-            		"score","result","win_prob","prob","implied","moneyline",
-            		"odds","final","post","series","label","target","outcome"
-            	)
-
-            	feat = []
-            	for col in df.columns:
-            		lc = str(col).lower()
-            		if col in (DATE_COL, ID_COL, TARGET):
-            			continue
-            		if any(s in lc for s in drop_sub):
-            			continue
-            		if "_score" in lc or lc.endswith("_w") or lc.endswith("_l"):
-            			continue
-            		if pd.api.types.is_numeric_dtype(df[col]) and df[col].notna().any():
-            			feat.append(col)
-
-            	keep_cols = [DATE_COL, ID_COL, TARGET] + feat
-            	df = df[keep_cols].copy().sort_values(DATE_COL).reset_index(drop=True)
-            	df.to_csv(OUT, index=False)
-            	print(f"[fallback] wrote {OUT} with {len(df)} rows and {len(feat)} features")
-            PY
-          fi
+          echo "Skipping fallback builder. Your repo/orchestrator provides features."
 
       - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
         shell: bash
@@ -129,8 +78,8 @@ jobs:
             fi
 
             if [ $success -eq 0 ] && [ -f out/raw_games.csv ]; then
-              python scripts/feature_build.py
-              success=1
+              echo "WARNING: raw dataset exists but no feature file; please add a builder script."
+              exit 2
             fi
 
             if [ $success -eq 0 ]; then
@@ -215,3 +164,4 @@ jobs:
           html_body: |
             <h2>MLB pipeline run failed</h2>
             <p>Check the Actions logs for the failing step.</p>
+
