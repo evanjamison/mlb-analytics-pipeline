@@ -256,6 +256,20 @@ def main(a):
         print("!! prepare_features failed.")
         sys.exit(3)
 
+    # ---------- 6) Validate prepared data ----------
+    if not os.path.exists(a.prepared):
+        print(f"!! Prepared dataset not found: {a.prepared}")
+        sys.exit(3)
+
+    prep_df = pd.read_csv(a.prepared)
+    if prep_df.empty or prep_df.shape[1] <= 3:
+        print(f"!! Prepared dataset is empty or has too few columns ({prep_df.shape})")
+        print("   Verify your prepare_features.py retains numeric columns.")
+        sys.exit(3)
+
+    print(f"[diag] Prepared dataset OK: {prep_df.shape[0]:,} rows × {prep_df.shape[1]:,} cols")
+
+
     # ---------- 6) Model training ----------
     print("\n== MODEL TRAINING ==")
     train_args = [
