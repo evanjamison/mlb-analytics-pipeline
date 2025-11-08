@@ -18,12 +18,15 @@ Notes:
 - Each update builds features only for the new span, with backfill warmup to keep rolling stats valid.
 """
 
+from __future__ import annotations
+
 import argparse, os, sys, json
 from datetime import datetime, timedelta, date
 import pandas as pd
 from pathlib import Path
-
 import importlib, inspect
+
+# import your ingest module
 data_ingest = importlib.import_module("data_ingest")
 
 # ---------------- utils ----------------
@@ -39,10 +42,10 @@ def read_csv_safe(path: str, parse_dates=None) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-def max_game_date(df: pd.DataFrame, date_col: str) -> date | None:
-    if date_col not in df.columns or df.empty:
+def max_game_date(df: pd.DataFrame, col: str) -> date | None:
+    if col not in df.columns or df.empty:
         return None
-    s = pd.to_datetime(df[date_col], errors="coerce").dt.date
+    s = pd.to_datetime(df[col], errors="coerce").dt.date
     if s.isna().all():
         return None
     return s.max()
@@ -63,13 +66,75 @@ def merge_dedupe_by_game_pk(existing: pd.DataFrame, new: pd.DataFrame) -> pd.Dat
     base = base.drop_duplicates(subset=["game_pk"], keep="last")
     return base
 
-def safe_today():
+def safe_today() -> date:
     # You can choose to stop at yesterday to avoid same-day incomplete games:
     return (datetime.utcnow() - timedelta(days=0)).date()
 
 def daterange_y(year_start: int, year_end: int):
     for y in range(year_start, year_end + 1):
         yield y
+
+# ---------------- signature-aware shims (NEW) ----------------
+def _safe_call_ingest_year(
+    year: int,
+    backfill_days: int,
+    out_path: str,
+    include_finished: bool = True,
+    fetch_handedness: bool = True,
+    max_workers: int = 20,
+):
+    """
+    Call whichever ingest function exists and pass only the kwargs it accepts.
+    Handles cases where your _ingest_year_to_raw doesn't accept max_workers, etc.
+    """
+    fn = getattr(data_ingest, "_ingest_year_to_raw", None) or getattr(data_ingest, "ingest_year_to_raw", None)
+    if fn is None:
+        raise RuntimeError("data_ingest.py is missing _ingest_year_to_raw/ingest_year_to_raw")
+
+    sig = inspect.signature(fn)
+    kwargs = {
+        "year": year,
+        "backfill_days": backfill_days,
+        "out_path": out_path,
+        "include_finished": include_finished,
+        "fetch_handedness": fetch_handedness,
+        "max_workers": max_workers,
+    }
+    allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return fn(**allowed)
+
+def _safe_build_features(
+    out_csv: str,
+    start_str: str,
+    end_str: str,
+    verbose: bool = True,
+):
+    """
+    Call build_feature_table (or similar) passing only the params it accepts,
+    mapping start/end to start_date/end_date if needed.
+    """
+    fn = getattr(data_ingest, "build_feature_table", None) or \
+         getattr(data_ingest, "build_features", None) or \
+         getattr(data_ingest, "build_feature_model", None)
+    if fn is None:
+        raise RuntimeError("data_ingest.py is missing build_feature_table/build_features/build_feature_model")
+
+    sig = inspect.signature(fn)
+    kwargs = {"out_csv": out_csv, "verbose": verbose}
+
+    # start/end argument names differ across your versions; map intelligently
+    if "start_date" in sig.parameters:
+        kwargs["start_date"] = start_str
+    elif "start" in sig.parameters:
+        kwargs["start"] = start_str
+
+    if "end_date" in sig.parameters:
+        kwargs["end_date"] = end_str
+    elif "end" in sig.parameters:
+        kwargs["end"] = end_str
+
+    allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return fn(**allowed)
 
 # ---------------- main orchestration ----------------
 def main(a):
@@ -92,8 +157,8 @@ def main(a):
 
     print(f"\n== RAW INGEST: ensuring years {y0}..{y1} are present in {a.raw} ==")
     for y in daterange_y(y0, y1):
-        # Always run year refresh because API records can change (lineups/handedness corrections)
-        data_ingest._ingest_year_to_raw(
+        # Use signature-aware shim (fixes 'unexpected keyword argument max_workers')
+        _safe_call_ingest_year(
             year=y,
             backfill_days=a.ingest_backfill_days,
             out_path=a.raw,
@@ -109,8 +174,6 @@ def main(a):
         sys.exit(2)
 
     # 2) Determine feature-build span
-    #    We need a warmup window so new rolling features are valid.
-    #    We base 'prev_end' from the EXISTING COMBINED features file (or base file if combined doesn't exist).
     combined_exists = os.path.exists(a.features_combined)
     if not combined_exists and os.path.exists(a.features_base):
         # initialize COMBINED from BASE (2024) on first run
@@ -125,31 +188,31 @@ def main(a):
 
     prev_end = max_game_date(features_df, a.date_col)
     if prev_end is None:
-        # no combined yet: build from Jan 1 of base_year
+        # no combined yet: build from Jan 1 of base_year, with warmup
         start_build = date(a.base_year, 1, 1) - timedelta(days=a.feature_backfill_days)
         print(f"[span] No combined features yet; building from {start_build} → {update_to}")
     else:
         # build from prev_end + 1 day, but extend back by warmup days for rolling stats
         start_build = max(prev_end + timedelta(days=1) - timedelta(days=a.feature_backfill_days),
                           date(a.base_year, 1, 1) - timedelta(days=a.feature_backfill_days))
-        print(f"[span] Existing combined through {prev_end}. Building NEW features from {start_build} → {update_to} (with warmup {a.feature_backfill_days}d)")
+        print(f"[span] Existing combined through {prev_end}. Building NEW features from {start_build} → {update_to} (warmup {a.feature_backfill_days}d)")
 
     if start_build > update_to:
         print("[span] Nothing new to build. Proceeding to EDA/prepare/model with current combined.")
         new_feat = pd.DataFrame()
     else:
-        # 3) Build NEW features for the span (OUT TO A TEMP)
+        # 3) Build NEW features for the span (to a temp file)
         tmp_new_csv = os.path.join("out", f"_tmp_features_{start_build}_to_{update_to}.csv").replace(":", "-")
         os.makedirs("out", exist_ok=True)
-        built = data_ingest.build_feature_table(
-            start=start_build.strftime("%Y-%m-%d"),
-            end=update_to.strftime("%Y-%m-%d"),
+
+        # Use signature-aware builder (fixes start vs start_date args)
+        _safe_build_features(
             out_csv=tmp_new_csv,
+            start_str=start_build.strftime("%Y-%m-%d"),
+            end_str=update_to.strftime("%Y-%m-%d"),
             verbose=True,
         )
-        # build_feature_table may return the path; ensure we read it
-        if isinstance(built, tuple) or isinstance(built, list):
-            tmp_new_csv = built[-1]
+
         new_feat = read_csv_safe(tmp_new_csv, parse_dates=[a.date_col])
 
         # Keep only truly NEW rows after prev_end (so we don't double-count warmup)
@@ -183,7 +246,7 @@ def main(a):
         if code != 0:
             print("!! EDA script failed (continuing).")
 
-    # 6) Prepare features (your script should do encoding, imputation-friendly cleanup, etc.)
+    # 6) Prepare features (encoding/cleanup for modeling)
     print("\n== PREPARE FEATURES ==")
     cmd = f'{a.pybin} {a.prepare_script} --in "{a.features_combined}" --out "{a.prepared}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
     print("[exec]", cmd)
