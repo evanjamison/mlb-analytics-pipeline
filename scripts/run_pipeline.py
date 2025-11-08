@@ -250,7 +250,7 @@ def main(a):
 
     # ---------- 5) Prepare features ----------
     print("\n== PREPARE FEATURES ==")
-    cmd = f'{a.pybin} "{a.prepare_script}" --in "{a.features_combined}" --out "{a.prepared}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
+    cmd = f'{a.pybin} "{a.prepare_script}" --data "{a.features_combined}" --out "{a.prepared}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
     print("[exec]", cmd)
     if os.system(cmd) != 0:
         print("!! prepare_features failed.")
