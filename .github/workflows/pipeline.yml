@@ -59,16 +59,18 @@ jobs:
             echo ">> No orchestrator found - manual flow"
             mkdir -p out
 
-            # Minimal raw fallback to create combined features
-            python -c "import os, pandas as pd; \
-RAW='out/raw_games.csv'; \
-import sys; \
-assert os.path.exists(RAW), 'No raw_games.csv - add scripts/run_pipeline.py or provide RAW'; \
-df=pd.read_csv(RAW); \
-keep=['game_date','game_pk','home_win']; \
-df=df[[c for c in keep if c in df.columns]]; \
-df.to_csv('out/mlb_features_combined.csv', index=False); \
-print('[fallback] wrote out/mlb_features_combined.csv')"
+            # Raw fallback features (very slim) - only if prepare/model need something to chew on
+            python - <<'PY'
+import os, pandas as pd
+RAW = "out/raw_games.csv"
+if not os.path.exists(RAW):
+    raise SystemExit("No raw_games.csv - cannot fallback. Add scripts/run_pipeline.py instead.")
+df = pd.read_csv(RAW)
+keep = ['game_date','game_pk','home_win']
+df = df[[c for c in keep if c in df.columns]]
+df.to_csv("out/mlb_features_combined.csv", index=False)
+print("[fallback] wrote out/mlb_features_combined.csv")
+PY
 
             # EDA (best-effort)
             if [[ -f scripts/eda_scaffold.py ]]; then
