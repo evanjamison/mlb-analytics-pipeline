@@ -1,67 +1,56 @@
-name: MLB daily update & retrain
+name: update-train
 
 on:
-  workflow_dispatch: {}
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
   schedule:
-    # 09:15 AM Pacific (Standard Time) == 17:15 UTC
-    - cron: "15 17 * * *"
-
-# Needed so the action can push updated artifacts (out/*) back to the repo
-permissions:
-  contents: write
+    - cron: "15 8 * * *"   # daily @ 08:15 UTC (adjust as you like)
 
 jobs:
-  update-train:
+  train:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (try requirements.txt, else robust fallback)
-        shell: bash
-        run: |
-          set -e
-          python -m pip install --upgrade pip setuptools wheel
-          FAILED_REQ=0
-          if [ -f "requirements.txt" ]; then
-            if ! pip install -r requirements.txt ; then
-              FAILED_REQ=1
-            fi
-          else
-            FAILED_REQ=1
-          fi
-          if [ "$FAILED_REQ" = "1" ]; then
-            pip install --upgrade \
-              "numpy<2.2" "pandas<2.3" "matplotlib>=3.8" \
-              "scikit-learn>=1.4" "xgboost>=2.0" "lightgbm>=4.0" \
-              "catboost>=1.2.5" "statsmodels>=0.14" "requests>=2.31" \
-              "tqdm>=4.66" pybaseball mlb-statsapi
-          else
-            # keep statsapi fresh if you use it in your script
-            pip install --upgrade mlb-statsapi || true
-          fi
-
-      # ---- We removed the heredoc fallback builder; your repo/orchestrator provides features ----
-      - name: Skip fallback feature builder (not needed)
-        shell: bash
-        run: |
-          echo "Skipping fallback builder. Your repo/orchestrator provides features."
-
-      # ---- Unified orchestrator with safe manual fallback ----
-      - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
+      - name: Install deps (requirements.txt; else slim fallback)
         shell: bash
         run: |
           set -euo pipefail
+          if [[ -f requirements.txt ]]; then
+            python -m pip install -U pip
+            pip install -r requirements.txt
+          else
+            python -m pip install -U pip
+            pip install \
+              "numpy>=1.22" "pandas>=2.0" "matplotlib>=3.8" \
+              "scikit-learn>=1.3" "xgboost>=2.0" "lightgbm>=4.2" \
+              "catboost>=1.2" "statsmodels>=0.14" \
+              "mlbstatsapi>=1.7.1" "pybaseball>=2.2" "requests>=2.31"
+          fi
 
-          if [ -f "scripts/run_pipeline.py" ]; then
+      # We removed the heredoc fallback builder entirely; your repo provides feature code.
+      - name: Skip fallback feature builder (not needed)
+        shell: bash
+        run: echo "Skipping fallback builder. Using repo scripts."
+
+      - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
+        shell: bash
+        env:
+          # Make `scripts` importable (scripts.data_ingest, etc.)
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+
+          if [[ -f scripts/run_pipeline.py ]]; then
             echo ">> scripts/run_pipeline.py detected — running orchestrator"
             python scripts/run_pipeline.py \
               --pybin python \
@@ -70,110 +59,41 @@ jobs:
               --add-rolling \
               --add-interactions
           else
-            echo ">> No orchestrator found — using manual build/train flow"
+            echo ">> No orchestrator found — manual flow"
             mkdir -p out
-            success=0
 
-            # Try your data_ingest feature builder (A)
-            if python scripts/data_ingest.py --year 2025 --backfill-days 35 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
-              success=1
+            # Raw fallback features (very slim) – only if prepare/model need something to chew on
+            python - <<'PY'
+import pandas as pd, os
+RAW="out/raw_games.csv"
+if not os.path.exists(RAW):
+    raise SystemExit("No raw_games.csv — cannot fallback. Add run_pipeline.py instead.")
+df = pd.read_csv(RAW)
+keep = ['game_date','game_pk','home_win']
+df = df[[c for c in keep if c in df.columns]]
+df.to_csv("out/mlb_features_combined.csv", index=False)
+print("[fallback] wrote out/mlb_features_combined.csv")
+PY
+
+            # EDA (best-effort)
+            if [[ -f scripts/eda_scaffold.py ]]; then
+              python scripts/eda_scaffold.py \
+                --data "out/mlb_features_combined.csv" \
+                --date-col game_date --id-col game_pk --target home_win || true
             fi
 
-            # Try “all” mode that writes to ./out (B)
-            if [ $success -eq 0 ]; then
-              if python scripts/data_ingest.py --year 2025 --backfill-days 35 --all --out out 2>/dev/null; then
-                found="$(ls -1 out/mlb_features_*prepared*.csv 2>/dev/null | head -n1 || true)"
-                if [ -n "$found" ]; then cp "$found" out/mlb_features_prepared.csv; success=1; fi
-              fi
-            fi
-
-            # Hard fail if your ingest didn't emit features (we removed the legacy fallback)
-            if [ $success -eq 0 ]; then
-              echo "ERROR: No features CSV produced by data_ingest. Ensure it writes ./out/mlb_features_prepared.csv"
-              exit 2
-            fi
+            # Prepare
+            python scripts/prepare_features.py \
+              --data "out/mlb_features_combined.csv" \
+              --out "out/mlb_features_prepared.csv" \
+              --date-col game_date --id-col game_pk --target home_win
 
             # Train
             python scripts/model_train_allinone.py \
               --data "out/mlb_features_prepared.csv" \
-              --date-col game_date \
-              --id-col game_pk \
-              --target home_win \
-              --outdir "model_all_ts" \
-              --topk 25 \
-              --threshold-strategy f1 \
-              --add-rolling \
-              --add-interactions \
-              --calibration isotonic \
-              --walkforward ts \
-              --n-splits 6
+              --date-col game_date --id-col game_pk --target home_win \
+              --outdir "model_all_ts" --topk 25 --threshold-strategy f1 \
+              --add-rolling --add-interactions \
+              --calibration isotonic --walkforward monthly --n-splits 6 \
+              --min-edge 0.02 --kelly-cap 0.05
           fi
-
-      # ---- Upload artifacts so you can download from the Actions run ----
-      - name: Upload artifacts (reports + datasets)
-        uses: actions/upload-artifact@v4
-        with:
-          name: mlb-artifacts
-          if-no-files-found: warn
-          retention-days: 14
-          path: |
-            out/**
-            eda_out/**/*
-            eda_out_plus/**/*
-            model_out/**/*
-            model_all_ts/**/*
-
-      # ---- Commit any changed outputs back to the repo (optional) ----
-      - name: Commit results (if changed)
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "CI: ingest + feature prep + retrain (auto)"
-            git push
-          fi
-
-      # ---- Email alerts (requires your SMTP secrets set) ----
-      - name: Send success email
-        if: success()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "✅ MLB pipeline SUCCESS — ${{ github.repository }} #${{ github.run_number }}"
-          to: ${{ secrets.ALERT_TO }}
-          from: ${{ secrets.ALERT_FROM }}
-          secure: true
-          html_body: |
-            <h2>MLB pipeline run succeeded</h2>
-            <ul>
-              <li><b>Repo:</b> ${{ github.repository }}</li>
-              <li><b>Run ID:</b> ${{ github.run_id }}</li>
-              <li><b>Branch:</b> ${{ github.ref_name }}</li>
-              <li><b>Commit:</b> ${{ github.sha }}</li>
-              <li><b>Timestamp (UTC):</b> ${{ github.run_started_at }}</li>
-            </ul>
-
-      - name: Send failure email
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "❌ MLB pipeline FAILED — ${{ github.repository }} #${{ github.run_number }}"
-          to: ${{ secrets.ALERT_TO }}
-          from: ${{ secrets.ALERT_FROM }}
-          secure: true
-          html_body: |
-            <h2>MLB pipeline run failed</h2>
-            <p>Check the Actions logs for the failing step.</p>
-
-

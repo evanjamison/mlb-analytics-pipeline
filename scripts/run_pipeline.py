@@ -1,34 +1,64 @@
 #!/usr/bin/env python
 """
-End-to-end MLB pipeline orchestrator
-------------------------------------
-Flow:
-  RAW ingest (per year, with warmup)
-  → feature build (calls data_ingest.build_feature_table)
-  → EDA (optional)
-  → prepare_features
-  → model_train_allinone
+End-to-end MLB pipeline runner (incremental updates)
+- Uses your scripts/data_ingest.py to ingest/build features (no leakage).
+- Keeps an always-growing combined features CSV (dedup by game_pk).
+- Runs EDA -> prepare_features -> model_train_allinone.
 
-Usage (PowerShell example):
-  py scripts/run_pipeline.py --base-year 2024 ^
-    --features-base out/mlb_features_2024.csv ^
-    --features-combined out/mlb_features_combined.csv ^
-    --prepared out/mlb_features_prepared.csv ^
-    --model-out model_all_ts ^
-    --run-eda --add-rolling --add-interactions
+Usage (PowerShell):
+  py scripts\\run_pipeline.py --base-year 2024 --run-eda --add-rolling --add-interactions
 """
 
 from __future__ import annotations
-
-import argparse, os, sys, importlib, inspect, shutil
+import argparse, os, sys, json
 from datetime import datetime, timedelta, date
+from pathlib import Path
 import pandas as pd
+import importlib.util
+
+# ---------------- Robust import of data_ingest ----------------
+def _load_data_ingest():
+    """
+    Make `scripts.data_ingest` importable whether the runner is on CI or locally.
+    Falls back to loading by exact file path if package import fails.
+    """
+    # 1) Try normal import if PYTHONPATH already contains repo root.
+    try:
+        import scripts.data_ingest as data_ingest  # type: ignore
+        return data_ingest
+    except Exception:
+        pass
+
+    # 2) Ensure repo root on sys.path, try again.
+    here = Path(__file__).resolve()
+    repo_root = here.parent.parent  # repo/
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    try:
+        import scripts.data_ingest as data_ingest  # type: ignore
+        return data_ingest
+    except Exception:
+        pass
+
+    # 3) Final fallback: load by file path
+    di_path = repo_root / "scripts" / "data_ingest.py"
+    if not di_path.exists():
+        raise ModuleNotFoundError("Could not import scripts.data_ingest and data_ingest.py not found.")
+    spec = importlib.util.spec_from_file_location("data_ingest", str(di_path))
+    mod = importlib.util.module_from_spec(spec)  # type: ignore
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)                 # type: ignore
+    return mod
+
+data_ingest = _load_data_ingest()
+# ---------------------------------------------------------------
+
 
 # ---------------- utils ----------------
-def ensure_dir(p: str) -> str:
-    if p:
-        os.makedirs(p, exist_ok=True)
-    return p or "."
+def ensure_dir(p: str | os.PathLike) -> str:
+    p = str(p)
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    return p
 
 def read_csv_safe(path: str, parse_dates=None) -> pd.DataFrame:
     if not path or not os.path.exists(path):
@@ -45,162 +75,128 @@ def max_game_date(df: pd.DataFrame, date_col: str) -> date | None:
     return None if s.isna().all() else s.max()
 
 def safe_today() -> date:
-    # use UTC "today" (you can subtract 1 if you prefer to avoid same-day partials)
-    return (datetime.utcnow() - timedelta(days=0)).date()
+    # Stop at today; change to -1 day if you prefer.
+    return (datetime.utcnow()).date()
 
-def discover_feature_builder(mod):
-    """Return (callable, name) for a feature builder found in data_ingest, else (None, None)."""
-    for name in (
-        "build_feature_table",
-        "build_features",
-        "build_feature_model",
-        "build_feature_table_model",
-    ):
-        fn = getattr(mod, name, None)
-        if callable(fn):
-            return fn, name
-    return None, None
-
-def discover_year_ingest(mod):
-    """Return a callable year ingestor if available; prefer public wrapper."""
-    for name in ("build_raw_dataset_year", "_ingest_year_to_raw"):
-        fn = getattr(mod, name, None)
-        if callable(fn):
-            return fn, name
-    return None, None
-
-# ---------------- main orchestration ----------------
+# ---------------- orchestrator ----------------
 def main(a):
-    for p in (
-        os.path.dirname(a.raw),
-        os.path.dirname(a.features_base),
-        os.path.dirname(a.features_combined),
-        os.path.dirname(a.prepared),
-        a.model_out,
-        "out",
-    ):
+    # Ensure dirs
+    for p in (a.raw, a.features_base, a.features_combined, a.prepared):
         ensure_dir(p)
+    os.makedirs(a.model_out, exist_ok=True)
 
-    # import user's data_ingest next to this script or on PYTHONPATH
-    data_ingest = importlib.import_module("scripts.data_ingest" if os.path.exists("scripts/data_ingest.py") else "data_ingest")
-    print("[diag] using data_ingest at:", inspect.getsourcefile(data_ingest))
+    print(f"[diag] using data_ingest at: {getattr(data_ingest, '__file__', 'unknown')}")
 
-    builder, builder_name = discover_feature_builder(data_ingest)
-    ingestor, ingestor_name = discover_year_ingest(data_ingest)
+    # 0) Load any existing combined
+    features_df = read_csv_safe(a.features_combined, parse_dates=[a.date_col])
 
-    # 0) load existing artifacts
-    combined = read_csv_safe(a.features_combined, parse_dates=[a.date_col])
-    base2024 = read_csv_safe(a.features_base, parse_dates=[a.date_col])
-    prev_end = max_game_date(combined, a.date_col)
-
-    # If no combined yet but a base features file exists, seed it.
-    if combined.empty and not base2024.empty:
-        print(f"[init] Seeding combined features from base → {a.features_base}")
-        base2024.to_csv(a.features_combined, index=False)
-        combined = base2024.copy()
-        prev_end = max_game_date(combined, a.date_col)
-
-    # 1) Ingest RAW per year (with warmup) so builder has everything
+    # 1) Ingest/refresh RAW for each year (with warmup), up to update_to
     update_to = datetime.strptime(a.update_to, "%Y-%m-%d").date() if a.update_to else safe_today()
     y0, y1 = a.base_year, update_to.year
-    if ingestor:
-        print(f"[ingest] using {ingestor_name} for years {y0}..{y1}")
-        for y in range(y0, y1 + 1):
-            # keep kwargs flexible for either wrapper signature
-            try:
-                ingestor(
-                    year=y,
-                    backfill_days=a.ingest_backfill_days,
-                    out_csv=a.raw,
-                    out_path=a.raw,  # works for _ingest_year_to_raw
-                    include_finished=True,
-                    fetch_handedness=True,
-                    max_workers=a.max_workers,
-                )
-            except TypeError:
-                # try minimal signature
-                ingestor(y)
-    else:
-        print("[warn] No year ingestor exposed in data_ingest; skipping raw ingest step.")
+    print(f"\n== RAW INGEST: ensuring years {y0}..{y1} are present in {a.raw} ==")
+    for year in range(y0, y1 + 1):
+        data_ingest._ingest_year_to_raw(
+            year=year,
+            backfill_days=a.ingest_backfill_days,
+            out_path=a.raw,
+            include_finished=True,
+            fetch_handedness=True,
+            max_workers=a.max_workers,
+        )
 
-    # 2) Decide feature span with warmup
-    warmup = timedelta(days=a.feature_backfill_days)
+    # Reload raw after writes
+    raw_df = read_csv_safe(a.raw, parse_dates=["game_date", "game_datetime"])
+    if raw_df.empty:
+        print("!! No raw data available after ingest; aborting.")
+        sys.exit(2)
+
+    # 2) Determine span to build
+    combined_exists = os.path.exists(a.features_combined)
+    if not combined_exists and os.path.exists(a.features_base):
+        print(f"[init] Seeding combined from base: {a.features_base}")
+        base_ = read_csv_safe(a.features_base, parse_dates=[a.date_col])
+        if not base_.empty:
+            base_.to_csv(a.features_combined, index=False)
+            features_df = base_.copy()
+
+    prev_end = max_game_date(features_df, a.date_col)
     if prev_end is None:
-        start_build = date(a.base_year, 1, 1) - warmup
-        print(f"[span] No combined features yet; building from {start_build} → {update_to} (warmup {a.feature_backfill_days}d)")
+        start_build = date(a.base_year, 1, 1) - timedelta(days=a.feature_backfill_days)
+        print(f"[span] No combined features yet; building from {start_build} → {update_to}")
     else:
-        start_build = max(prev_end + timedelta(days=1) - warmup, date(a.base_year, 1, 1) - warmup)
-        print(f"[span] Combined through {prev_end}; building from {start_build} → {update_to} (warmup {a.feature_backfill_days}d)")
+        start_build = max(
+            prev_end + timedelta(days=1) - timedelta(days=a.feature_backfill_days),
+            date(a.base_year, 1, 1) - timedelta(days=a.feature_backfill_days),
+        )
+        print(f"[span] Existing combined through {prev_end}. Building NEW features from {start_build} → {update_to} (warmup {a.feature_backfill_days}d)")
 
-    # 3) Build features via data_ingest builder (preferred)
-    new_feat = pd.DataFrame()
-    if start_build <= update_to:
-        if builder:
-            print(f"[builder] calling {builder_name}(start,end,out_csv,verbose)")
-            tmp_csv = os.path.join("out", f"_tmp_features_{start_build}_to_{update_to}.csv").replace(":", "-")
-            out_path = builder(
+    # 3) Build features for span (using your data_ingest builder if present; else safe fallback)
+    if start_build > update_to:
+        new_feat = pd.DataFrame()
+        print("[span] Nothing new to build.")
+    else:
+        tmp_new_csv = os.path.join("out", f"_tmp_features_{start_build}_to_{update_to}.csv").replace(":", "-")
+        os.makedirs("out", exist_ok=True)
+
+        # Prefer your own full feature builder if it exists
+        build_fn = getattr(data_ingest, "build_feature_table", None)
+        if callable(build_fn):
+            built = build_fn(
                 start=start_build.strftime("%Y-%m-%d"),
                 end=update_to.strftime("%Y-%m-%d"),
-                out_csv=tmp_csv,
+                out_csv=tmp_new_csv,
                 verbose=True,
-                max_workers=a.max_workers,
             )
-            built = read_csv_safe(out_path, parse_dates=[a.date_col])
-            if prev_end is not None and not built.empty:
-                gd = pd.to_datetime(built[a.date_col], errors="coerce").dt.date
-                built = built.loc[gd > prev_end].copy()
-            new_feat = built
-            print(f"[builder] new rows post-filter: {len(new_feat):,}")
+            if isinstance(built, (list, tuple)):
+                tmp_new_csv = built[-1]
         else:
-            # Fallback: minimal, leak-safe features from raw (date/id/target only)
-            print("[fallback] data_ingest has no feature builder; writing minimal features from raw.")
-            raw_df = read_csv_safe(a.raw, parse_dates=["game_date", "game_datetime"])
-            keep = [c for c in (a.date_col, a.id_col, a.target) if c in raw_df.columns]
-            new_feat = raw_df[keep].copy() if keep else pd.DataFrame()
-    else:
-        print("[span] Nothing to build; up to date.")
+            # leak-safe minimal fallback directly from raw
+            print("[warn] data_ingest has no feature builder; using leak-safe fallback from raw.")
+            sub = raw_df.copy()
+            sub = sub[(pd.to_datetime(sub["game_date"]).dt.date >= start_build) &
+                      (pd.to_datetime(sub["game_date"]).dt.date <= update_to)]
+            keep = [c for c in ("game_date","game_pk","home_win") if c in sub.columns]
+            sub = sub[keep].drop_duplicates("game_pk")
+            sub.to_csv(tmp_new_csv, index=False)
 
-    # 4) Append + dedupe combined by game_pk
+        new_feat = read_csv_safe(tmp_new_csv, parse_dates=[a.date_col])
+        if prev_end is not None and not new_feat.empty:
+            gd = pd.to_datetime(new_feat[a.date_col], errors="coerce").dt.date
+            new_feat = new_feat.loc[gd > prev_end].copy()
+        print(f"[new] Built {len(new_feat):,} NEW feature rows (post-filter).")
+
+    # 4) Append to COMBINED
     if not new_feat.empty:
-        current = read_csv_safe(a.features_combined, parse_dates=[a.date_col])
-        merged = pd.concat([current, new_feat], ignore_index=True) if not current.empty else new_feat
-        if "game_pk" in merged.columns:
-            sort_cols = [c for c in [a.date_col, "game_pk"] if c in merged.columns]
-            if sort_cols:
-                merged = merged.sort_values(sort_cols)
-            merged = merged.drop_duplicates(subset=["game_pk"], keep="last")
+        combined_old = read_csv_safe(a.features_combined, parse_dates=[a.date_col])
+        combined_new = pd.concat([combined_old, new_feat], ignore_index=True) if not combined_old.empty else new_feat
+        if "game_pk" in combined_new.columns:
+            combined_new = combined_new.sort_values([a.date_col, "game_pk"])
+            combined_new = combined_new.drop_duplicates(subset=["game_pk"], keep="last")
         else:
-            merged = merged.drop_duplicates()
-        merged.to_csv(a.features_combined, index=False)
-        print(f"[combine] wrote → {a.features_combined}  (rows: {len(merged):,}, cols: {merged.shape[1]})")
+            combined_new = combined_new.drop_duplicates()
+        combined_new = combined_new.sort_values(a.date_col).reset_index(drop=True)
+        combined_new.to_csv(a.features_combined, index=False)
+        print(f"[combine] Wrote combined → {a.features_combined}  (rows: {len(combined_new):,})")
     else:
         print("[combine] No new rows to append.")
 
     # 5) EDA (optional)
-    if a.run_eda:
-        eda_path = a.eda_script if os.path.exists(a.eda_script) else os.path.join("scripts", a.eda_script)
-        if os.path.exists(eda_path):
-            print("\n== EDA ==")
-            cmd = f'{a.pybin} "{eda_path}" --data "{a.features_combined}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
-            print("[exec]", cmd)
-            code = os.system(cmd)
-            if code != 0:
-                print("!! EDA failed (continuing).")
-        else:
-            print(f"[warn] EDA script not found at {eda_path}; skipping.")
+    if a.run_eda and os.path.exists(a.eda_script):
+        print("\n== EDA ==")
+        cmd = f'{a.pybin} {a.eda_script} --data "{a.features_combined}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
+        print("[exec]", cmd)
+        os.system(cmd)
 
     # 6) Prepare features
-    prep_path = a.prepare_script if os.path.exists(a.prepare_script) else os.path.join("scripts", a.prepare_script)
     print("\n== PREPARE FEATURES ==")
-    cmd = f'{a.pybin} "{prep_path}" --data "{a.features_combined}" --out "{a.prepared}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
+    cmd = f'{a.pybin} {a.prepare_script} --data "{a.features_combined}" --out "{a.prepared}" --date-col {a.date_col} --id-col {a.id_col} --target {a.target}'
     print("[exec]", cmd)
-    code = os.system(cmd)
-    if code != 0:
+    rc = os.system(cmd)
+    if rc != 0:
         print("!! prepare_features failed.")
         sys.exit(3)
 
-    # 7) Model training
-    model_path = a.model_script if os.path.exists(a.model_script) else os.path.join("scripts", a.model_script)
+    # 7) Train
     print("\n== MODEL TRAINING ==")
     train_args = [
         f'--data "{a.prepared}"',
@@ -215,15 +211,15 @@ def main(a):
         f'--calibration {a.calibration}',
         f'--walkforward {a.walkforward}',
         f'--n-splits {a.n_splits}',
-        (f'--home-odds-col {a.home_odds_col}' if a.home_odds_col else ""),
-        (f'--away-odds-col {a.away_odds_col}' if a.away_odds_col else ""),
+        f'--home-odds-col {a.home_odds_col}' if a.home_odds_col else "",
+        f'--away-odds-col {a.away_odds_col}' if a.away_odds_col else "",
         f'--min-edge {a.min_edge:.3f}',
         f'--kelly-cap {a.kelly_cap:.3f}',
     ]
-    cmd = f'{a.pybin} "{model_path}" ' + " ".join([t for t in train_args if t])
+    cmd = f'{a.pybin} {a.model_script} ' + " ".join([t for t in train_args if t])
     print("[exec]", cmd)
-    code = os.system(cmd)
-    if code != 0:
+    rc = os.system(cmd)
+    if rc != 0:
         print("!! model_train_allinone failed.")
         sys.exit(4)
 
@@ -233,13 +229,11 @@ def main(a):
     print("  Prepared dataset :", a.prepared)
     print("  Model out dir    :", a.model_out)
 
-# ---------------- CLI ----------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     # IO
     ap.add_argument("--raw", default="out/raw_games.csv")
-    ap.add_argument("--features-base", default="out/mlb_features_2024.csv",
-                    help="Existing 2024 features to seed combined on first run.")
+    ap.add_argument("--features-base", default="out/mlb_features_2024.csv")
     ap.add_argument("--features-combined", default="out/mlb_features_combined.csv")
     ap.add_argument("--prepared", default="out/mlb_features_prepared.csv")
     ap.add_argument("--model-out", default="model_all_ts")
@@ -251,15 +245,15 @@ if __name__ == "__main__":
     ap.add_argument("--base-year", type=int, default=2024)
     ap.add_argument("--update-to", type=str, default=None, help="YYYY-MM-DD (default: today UTC)")
     # Backfills
-    ap.add_argument("--ingest-backfill-days", type=int, default=35, help="Raw ingest warmup days per season")
-    ap.add_argument("--feature-backfill-days", type=int, default=35, help="Warmup days for rolling features")
-    # Concurrency
+    ap.add_argument("--ingest-backfill-days", type=int, default=35)
+    ap.add_argument("--feature-backfill-days", type=int, default=35)
+    # Concurrency for ingest
     ap.add_argument("--max-workers", type=int, default=20)
     # Script paths/binaries
-    ap.add_argument("--pybin", default="python")  # use "py" on Windows if preferred
-    ap.add_argument("--eda-script", default="eda_scaffold.py")
-    ap.add_argument("--prepare-script", default="prepare_features.py")
-    ap.add_argument("--model-script", default="model_train_allinone.py")
+    ap.add_argument("--pybin", default="python")
+    ap.add_argument("--eda-script", default="scripts/eda_scaffold.py")
+    ap.add_argument("--prepare-script", default="scripts/prepare_features.py")
+    ap.add_argument("--model-script", default="scripts/model_train_allinone.py")
     ap.add_argument("--run-eda", action="store_true")
     # Modeling knobs
     ap.add_argument("--topk", type=int, default=25)
@@ -275,6 +269,5 @@ if __name__ == "__main__":
     ap.add_argument("--min-edge", type=float, default=0.02)
     ap.add_argument("--kelly-cap", type=float, default=0.05)
 
-    args = ap.parse_args()
-    main(args)
+    main(ap.parse_args())
 
