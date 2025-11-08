@@ -23,6 +23,7 @@ from pathlib import Path
 import importlib
 import pandas as pd
 import numpy as np
+import platform
 
 # ---------------- utils ----------------
 def ensure_dir(p: str) -> str:
@@ -316,7 +317,9 @@ if __name__ == "__main__":
     # Concurrency hint for ingest
     ap.add_argument("--max-workers", type=int, default=20)
     # Script paths/binaries
-    ap.add_argument("--pybin", default="py")  # use "python" on mac/linux
+    default_pybin = "python" if platform.system().lower() != "windows" else "py"
+    ap.add_argument("--pybin", default=default_pybin)  # auto: 'python' on Linux/Mac, 'py' on Windows
+
     ap.add_argument("--eda-script", default="eda_scaffold.py")
     ap.add_argument("--prepare-script", default="prepare_features.py")
     ap.add_argument("--model-script", default="model_train_allinone.py")
