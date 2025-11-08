@@ -5,7 +5,7 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
   schedule:
-    - cron: "15 8 * * *"   # daily @ 08:15 UTC (adjust as you like)
+    - cron: "15 8 * * *"   # daily @ 08:15 UTC
 
 jobs:
   train:
@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (requirements.txt; else slim fallback)
+      - name: Install deps
         shell: bash
         run: |
           set -euo pipefail
@@ -37,21 +37,15 @@ jobs:
               "mlbstatsapi>=1.7.1" "pybaseball>=2.2" "requests>=2.31"
           fi
 
-      # We removed the heredoc fallback builder entirely; your repo provides feature code.
-      - name: Skip fallback feature builder (not needed)
-        shell: bash
-        run: echo "Skipping fallback builder. Using repo scripts."
-
       - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
         shell: bash
         env:
-          # Make `scripts` importable (scripts.data_ingest, etc.)
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
 
           if [[ -f scripts/run_pipeline.py ]]; then
-            echo ">> scripts/run_pipeline.py detected — running orchestrator"
+            echo ">> scripts/run_pipeline.py detected - running orchestrator"
             python scripts/run_pipeline.py \
               --pybin python \
               --base-year 2024 \
@@ -59,15 +53,15 @@ jobs:
               --add-rolling \
               --add-interactions
           else
-            echo ">> No orchestrator found — manual flow"
+            echo ">> No orchestrator found - manual flow"
             mkdir -p out
 
-            # Raw fallback features (very slim) – only if prepare/model need something to chew on
+            # Raw fallback features (very slim) - only if prepare/model need something to chew on
             python - <<'PY'
 import pandas as pd, os
 RAW="out/raw_games.csv"
 if not os.path.exists(RAW):
-    raise SystemExit("No raw_games.csv — cannot fallback. Add run_pipeline.py instead.")
+    raise SystemExit("No raw_games.csv - cannot fallback. Add run_pipeline.py instead.")
 df = pd.read_csv(RAW)
 keep = ['game_date','game_pk','home_win']
 df = df[[c for c in keep if c in df.columns]]
@@ -97,3 +91,4 @@ PY
               --calibration isotonic --walkforward monthly --n-splits 6 \
               --min-edge 0.02 --kelly-cap 0.05
           fi
+
