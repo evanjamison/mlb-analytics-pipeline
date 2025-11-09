@@ -88,9 +88,9 @@ jobs:
             python scripts/run_pipeline.py \
               --pybin python \
               --base-year 2024 \
-              --ingest-backfill-days 30 \
-              --feature-backfill-days 30 \
-              --max-update-days 30 \
+              --ingest-backfill-days 45 \
+              --feature-backfill-days 45 \
+              --max-update-days 60 \
               --run-eda \
               --add-rolling \
               --add-interactions

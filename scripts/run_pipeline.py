@@ -247,10 +247,10 @@ if __name__ == "__main__":
     ap.add_argument("--base-year", type=int, default=2024)
     ap.add_argument("--update-to", type=str, default=None, help="YYYY-MM-DD (default: today UTC)")
     # Backfills
-    ap.add_argument("--ingest-backfill-days", type=int, default=35)
-    ap.add_argument("--feature-backfill-days", type=int, default=35)
+    ap.add_argument("--ingest-backfill-days", type=int, default=45)
+    ap.add_argument("--feature-backfill-days", type=int, default=45)
     # ---- NEW: hard cap for incremental updates ----
-    ap.add_argument("--max-update-days", type=int, default=30,
+    ap.add_argument("--max-update-days", type=int, default=60,
                     help="Maximum span (days) to update/build per run (default: 30).")
     # Concurrency for ingest
     ap.add_argument("--max-workers", type=int, default=20)
