@@ -90,10 +90,32 @@ def main(a):
     # 0) Load any existing combined
     features_df = read_csv_safe(a.features_combined, parse_dates=[a.date_col])
 
-    # 1) Ingest/refresh RAW for each year (with warmup), up to update_to
+    # 1) Choose update end date and (later) cap the window
     update_to = datetime.strptime(a.update_to, "%Y-%m-%d").date() if a.update_to else safe_today()
-    y0, y1 = a.base_year, update_to.year
-    print(f"\n== RAW INGEST: ensuring years {y0}..{y1} are present in {a.raw} ==")
+
+    # We'll compute start_build first based on existing data, then CAP to last N days.
+    prev_end = max_game_date(features_df, a.date_col)
+    if prev_end is None:
+        start_build = date(a.base_year, 1, 1) - timedelta(days=a.feature_backfill_days)
+        print(f"[span] No combined features yet; initial build from {start_build} → {update_to}")
+    else:
+        start_build = max(
+            prev_end + timedelta(days=1) - timedelta(days=a.feature_backfill_days),
+            date(a.base_year, 1, 1) - timedelta(days=a.feature_backfill_days),
+        )
+        print(f"[span] Existing combined through {prev_end}. Planned NEW features from {start_build} → {update_to} (warmup {a.feature_backfill_days}d)")
+
+    # ---- NEW: hard cap incremental work to last N days ----
+    cap_start = update_to - timedelta(days=a.max_update_days)
+    if start_build < cap_start:
+        print(f"[cap] Capping build window to last {a.max_update_days} days: {cap_start} → {update_to}")
+        start_build = cap_start
+
+    # 1b) Ingest/refresh RAW only for years that intersect our capped window (+ ingest warmup)
+    # We extend a bit earlier for ingest, so feature builder has enough context.
+    ingest_start = max(date(a.base_year, 1, 1), start_build - timedelta(days=a.ingest_backfill_days))
+    y0, y1 = ingest_start.year, update_to.year
+    print(f"\n== RAW INGEST: ensuring years {y0}..{y1} cover { ingest_start } → { update_to } (ingest backfill {a.ingest_backfill_days}d) ==")
     for year in range(y0, y1 + 1):
         data_ingest._ingest_year_to_raw(
             year=year,
@@ -110,27 +132,7 @@ def main(a):
         print("!! No raw data available after ingest; aborting.")
         sys.exit(2)
 
-    # 2) Determine span to build
-    combined_exists = os.path.exists(a.features_combined)
-    if not combined_exists and os.path.exists(a.features_base):
-        print(f"[init] Seeding combined from base: {a.features_base}")
-        base_ = read_csv_safe(a.features_base, parse_dates=[a.date_col])
-        if not base_.empty:
-            base_.to_csv(a.features_combined, index=False)
-            features_df = base_.copy()
-
-    prev_end = max_game_date(features_df, a.date_col)
-    if prev_end is None:
-        start_build = date(a.base_year, 1, 1) - timedelta(days=a.feature_backfill_days)
-        print(f"[span] No combined features yet; building from {start_build} → {update_to}")
-    else:
-        start_build = max(
-            prev_end + timedelta(days=1) - timedelta(days=a.feature_backfill_days),
-            date(a.base_year, 1, 1) - timedelta(days=a.feature_backfill_days),
-        )
-        print(f"[span] Existing combined through {prev_end}. Building NEW features from {start_build} → {update_to} (warmup {a.feature_backfill_days}d)")
-
-    # 3) Build features for span (using your data_ingest builder if present; else safe fallback)
+    # 3) Build features for the (capped) span
     if start_build > update_to:
         new_feat = pd.DataFrame()
         print("[span] Nothing new to build.")
@@ -247,6 +249,9 @@ if __name__ == "__main__":
     # Backfills
     ap.add_argument("--ingest-backfill-days", type=int, default=35)
     ap.add_argument("--feature-backfill-days", type=int, default=35)
+    # ---- NEW: hard cap for incremental updates ----
+    ap.add_argument("--max-update-days", type=int, default=30,
+                    help="Maximum span (days) to update/build per run (default: 30).")
     # Concurrency for ingest
     ap.add_argument("--max-workers", type=int, default=20)
     # Script paths/binaries
@@ -270,4 +275,3 @@ if __name__ == "__main__":
     ap.add_argument("--kelly-cap", type=float, default=0.05)
 
     main(ap.parse_args())
-

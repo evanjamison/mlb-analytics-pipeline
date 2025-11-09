@@ -76,6 +76,7 @@ jobs:
             python scripts/run_pipeline.py \
               --pybin python \
               --base-year 2024 \
+              --backfill-days 30 \
               --run-eda \
               --add-rolling \
               --add-interactions
@@ -84,14 +85,14 @@ jobs:
             mkdir -p out
             success=0
 
-            # Try to build features using data_ingest
-            if python scripts/data_ingest.py --year 2025 --backfill-days 35 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
+            # Try to build features using data_ingest (last 30 days)
+            if python scripts/data_ingest.py --year 2025 --backfill-days 30 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
               success=1
             fi
 
-            # Secondary fallback
+            # Secondary fallback (all → writes to ./out, still last 30 days)
             if [[ $success -eq 0 ]]; then
-              if python scripts/data_ingest.py --year 2025 --backfill-days 35 --all --out out 2>/dev/null; then
+              if python scripts/data_ingest.py --year 2025 --backfill-days 30 --all --out out 2>/dev/null; then
                 found="$(ls -1 out/mlb_features_*prepared*.csv 2>/dev/null | head -n1 || true)"
                 if [[ -n "$found" ]]; then
                   cp "$found" out/mlb_features_prepared.csv
@@ -126,6 +127,7 @@ jobs:
       # 5️⃣  Upload artifacts (datasets + reports)
       # -------------------------------
       - name: Upload artifacts (reports + datasets)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mlb-artifacts
@@ -142,6 +144,7 @@ jobs:
       # 6️⃣  Commit results (if changed)
       # -------------------------------
       - name: Commit results (if changed)
+        if: success()
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
@@ -154,3 +157,28 @@ jobs:
             git push
           fi
 
+      # -------------------------------
+      # 7️⃣  Send failure email (only if job failed)
+      # -------------------------------
+      - name: Send failure email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ MLB pipeline FAILED — ${{ github.repository }} #${{ github.run_number }}"
+          to: ${{ secrets.ALERT_TO }}
+          from: ${{ secrets.ALERT_FROM }}
+          secure: true
+          html_body: |
+            <h2>MLB pipeline run failed</h2>
+            <ul>
+              <li><b>Repo:</b> ${{ github.repository }}</li>
+              <li><b>Run ID:</b> ${{ github.run_id }}</li>
+              <li><b>Branch:</b> ${{ github.ref_name }}</li>
+              <li><b>Commit:</b> ${{ github.sha }}</li>
+              <li><b>Started (UTC):</b> ${{ github.run_started_at }}</li>
+            </ul>
+            <p>Check the run logs and downloaded artifacts (mlb-artifacts) for details.</p>
