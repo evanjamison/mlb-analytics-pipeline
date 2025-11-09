@@ -1,9 +1,9 @@
 name: MLB daily update & retrain
 
 on:
-  workflow_dispatch: {}           # enables manual "Run workflow" button
+  workflow_dispatch: {}
   schedule:
-    - cron: "15 17 * * *"         # runs daily @ 09:15 AM Pacific (17:15 UTC)
+    - cron: "15 17 * * *"   # 09:15 AM Pacific (17:15 UTC)
 
 permissions:
   contents: write
@@ -14,26 +14,20 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # -------------------------------
-      # 1️⃣  Checkout repo
-      # -------------------------------
+      # 1) Checkout
       - name: Check out repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # -------------------------------
-      # 2️⃣  Setup Python
-      # -------------------------------
+      # 2) Python
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # -------------------------------
-      # 3️⃣  Install dependencies
-      # -------------------------------
+      # 3) Deps
       - name: Install deps (try requirements.txt, else robust fallback)
         shell: bash
         run: |
@@ -41,7 +35,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
 
           FAILED_REQ=0
-          if [[ -f "requirements.txt" ]]; then
+          if [[ -f requirements.txt ]]; then
             if ! pip install -r requirements.txt ; then
               FAILED_REQ=1
             fi
@@ -50,33 +44,54 @@ jobs:
           fi
 
           if [[ "$FAILED_REQ" = "1" ]]; then
-            echo "⚙️ Falling back to pinned Py3.11-safe versions"
+            echo "Falling back to pinned Py3.11-safe versions"
             pip install --upgrade \
               "numpy<2.2" "pandas<2.3" "matplotlib>=3.8" \
               "scikit-learn>=1.4" "xgboost>=2.0" "lightgbm>=4.0" \
               "catboost>=1.2.5" "statsmodels>=0.14" "requests>=2.31" \
-              "tqdm>=4.66" \
-              "pybaseball>=2.2.7" \
-              "MLB-StatsAPI>=1.7.1"
+              "tqdm>=4.66" "pybaseball>=2.2.7" "MLB-StatsAPI>=1.7.1"
           else
             pip install --upgrade "MLB-StatsAPI>=1.7.1" || true
             pip install --upgrade "pybaseball>=2.2.7" || true
           fi
 
-      # -------------------------------
-      # 4️⃣  Orchestrator (run_pipeline.py)
-      # -------------------------------
+
+
+
+      - name: Sanity check workflow revision & flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GITHUB_SHA: $GITHUB_SHA"
+          echo "Branch: $GITHUB_REF_NAME"
+          echo "Top of pipeline.yml (first 160 lines):"
+          sed -n '1,160p' .github/workflows/pipeline.yml
+
+          echo "---- grep for old/invalid flag in workflow file ----"
+          if grep -n -- '--backfill-days' .github/workflows/pipeline.yml; then
+            echo "Found legacy flag --backfill-days in pipeline.yml. This will break run_pipeline.py."
+            exit 3
+          else
+            echo "OK: no legacy --backfill-days flag in this workflow file."
+          fi
+
+          echo "Python version:"
+          python --version
+
+      # 4) Orchestrator (with 30-day cap)
       - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ -f "scripts/run_pipeline.py" ]]; then
+          if [[ -f scripts/run_pipeline.py ]]; then
             echo ">> scripts/run_pipeline.py detected — running orchestrator"
             python scripts/run_pipeline.py \
               --pybin python \
               --base-year 2024 \
-              --backfill-days 30 \
+              --ingest-backfill-days 30 \
+              --feature-backfill-days 30 \
+              --max-update-days 30 \
               --run-eda \
               --add-rolling \
               --add-interactions
@@ -85,12 +100,11 @@ jobs:
             mkdir -p out
             success=0
 
-            # Try to build features using data_ingest (last 30 days)
+            # Last 30 days via your ingest
             if python scripts/data_ingest.py --year 2025 --backfill-days 30 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
               success=1
             fi
 
-            # Secondary fallback (all → writes to ./out, still last 30 days)
             if [[ $success -eq 0 ]]; then
               if python scripts/data_ingest.py --year 2025 --backfill-days 30 --all --out out 2>/dev/null; then
                 found="$(ls -1 out/mlb_features_*prepared*.csv 2>/dev/null | head -n1 || true)"
@@ -101,13 +115,11 @@ jobs:
               fi
             fi
 
-            # Hard fail if no dataset found
             if [[ $success -eq 0 ]]; then
-              echo "❌ ERROR: No features CSV produced by data_ingest."
+              echo "ERROR: No features CSV produced by data_ingest."
               exit 2
             fi
 
-            # Train model
             python scripts/model_train_allinone.py \
               --data "out/mlb_features_prepared.csv" \
               --date-col game_date \
@@ -123,9 +135,7 @@ jobs:
               --n-splits 6
           fi
 
-      # -------------------------------
-      # 5️⃣  Upload artifacts (datasets + reports)
-      # -------------------------------
+      # 5) Artifacts (always try; warnings OK if nothing produced on failure)
       - name: Upload artifacts (reports + datasets)
         if: always()
         uses: actions/upload-artifact@v4
@@ -140,9 +150,7 @@ jobs:
             model_out/**/*
             model_all_ts/**/*
 
-      # -------------------------------
-      # 6️⃣  Commit results (if changed)
-      # -------------------------------
+      # 6) Commit any changes
       - name: Commit results (if changed)
         if: success()
         shell: bash
@@ -153,13 +161,11 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "CI: ingest + feature prep + retrain (auto)"
+            git commit -m "CI: 30-day capped update + retrain"
             git push
           fi
 
-      # -------------------------------
-      # 7️⃣  Send failure email (only if job failed)
-      # -------------------------------
+      # 7) Email on failure
       - name: Send failure email
         if: failure()
         uses: dawidd6/action-send-mail@v3
