@@ -55,27 +55,26 @@ jobs:
             pip install --upgrade "pybaseball>=2.2.7" || true
           fi
 
-
-
-
-      - name: Sanity check workflow revision & flags
+      # Guard: only block legacy flag if it's on the run_pipeline.py line
+      - name: Guard legacy flag only on run_pipeline.py
         shell: bash
         run: |
           set -euo pipefail
           echo "GITHUB_SHA: $GITHUB_SHA"
           echo "Branch: $GITHUB_REF_NAME"
-          echo "Top of pipeline.yml (first 160 lines):"
-          sed -n '1,160p' .github/workflows/pipeline.yml
 
-          echo "---- grep for old/invalid flag in workflow file ----"
-          if grep -n -- '--backfill-days' .github/workflows/pipeline.yml; then
-            echo "Found legacy flag --backfill-days in pipeline.yml. This will break run_pipeline.py."
+          # Show the orchestrator section for quick debugging
+          echo "---- Orchestrator snippet (lines 140-220) ----"
+          sed -n '140,220p' .github/workflows/pipeline.yml || true
+          echo "---------------------------------------------"
+
+          # Fail ONLY if --backfill-days appears on the same line as run_pipeline.py
+          if grep -nE 'python[[:space:]]+scripts/run_pipeline\.py([^#\n]*)--backfill-days' .github/workflows/pipeline.yml; then
+            echo "::error::Found legacy --backfill-days on run_pipeline.py invocation. Use --ingest-backfill-days/--feature-backfill-days/--max-update-days instead."
             exit 3
-          else
-            echo "OK: no legacy --backfill-days flag in this workflow file."
           fi
+          echo "OK: no legacy --backfill-days on run_pipeline.py."
 
-          echo "Python version:"
           python --version
 
       # 4) Orchestrator (with 30-day cap)
@@ -100,7 +99,7 @@ jobs:
             mkdir -p out
             success=0
 
-            # Last 30 days via your ingest
+            # Last 30 days via your ingest (allowed to use --backfill-days here)
             if python scripts/data_ingest.py --year 2025 --backfill-days 30 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
               success=1
             fi
