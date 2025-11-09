@@ -247,6 +247,7 @@ if __name__ == "__main__":
     ap.add_argument("--base-year", type=int, default=2024)
     ap.add_argument("--update-to", type=str, default=None, help="YYYY-MM-DD (default: today UTC)")
     # Backfills
+    ap.add_argument("--max-update-days", type=int, default=30)
     ap.add_argument("--ingest-backfill-days", type=int, default=35)
     ap.add_argument("--feature-backfill-days", type=int, default=35)
     # ---- NEW: hard cap for incremental updates ----
@@ -274,4 +275,15 @@ if __name__ == "__main__":
     ap.add_argument("--min-edge", type=float, default=0.02)
     ap.add_argument("--kelly-cap", type=float, default=0.05)
 
-    main(ap.parse_args())
+
+    
+    args = ap.parse_args()
+    # Create out/ directory and seed missing combined file
+    os.makedirs("out", exist_ok=True)
+    if not os.path.exists("out/mlb_features_combined.csv"):
+        print("[init] Seeding empty combined file (first CI run)")
+        pd.DataFrame(columns=["game_date", "game_pk", "home_win"]).to_csv("out/mlb_features_combined.csv", index=False)
+
+    main(args)
+
+    #main(ap.parse_args())
