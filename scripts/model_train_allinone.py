@@ -325,7 +325,7 @@ def run(args):
     lb_csv = os.path.join(args.outdir, "leaderboard.csv")
     lb_top.to_csv(lb_csv, index=False)
 
-    # Save a compact JSON report
+    # Save a compact JSON report (now also includes betting flags)
     report = {
         "data": args.data,
         "rows": int(len(df)),
@@ -341,6 +341,8 @@ def run(args):
         "n_splits": args.n_splits,
         "calibration": args.calibration,
         "threshold_strategy": args.threshold_strategy,
+        "min_edge": args.min_edge,
+        "kelly_cap": args.kelly_cap,
         "leaderboard_head": lb_top.to_dict(orient="records"),
     }
     with open(os.path.join(args.outdir, "report.json"), "w") as f:
@@ -367,14 +369,18 @@ if __name__ == "__main__":
     ap.add_argument("--topk", type=int, default=25)
     ap.add_argument("--threshold-strategy", choices=["f1","youden","balanced"], default="f1")
 
-    ap.add_argument("--add-rolling", action="store_true")       # kept for CLI compatibility (no-op here)
-    ap.add_argument("--add-interactions", action="store_true")  # kept for CLI compatibility (no-op here)
+    # Kept for CLI compatibility (no-ops in this script — feature building is upstream)
+    ap.add_argument("--add-rolling", action="store_true")
+    ap.add_argument("--add-interactions", action="store_true")
 
     ap.add_argument("--calibration", choices=["raw","platt","isotonic"], default="isotonic")
     ap.add_argument("--walkforward", choices=["monthly","ts","none"], default="monthly")
     ap.add_argument("--n-splits", type=int, default=6)
 
+    # NEW: accept betting params so orchestrator can pass them without error
+    ap.add_argument("--min-edge", type=float, default=0.02, help="Minimum betting edge (default: 0.02)")
+    ap.add_argument("--kelly-cap", type=float, default=0.05, help="Kelly bet size cap (default: 0.05)")
+
     args = ap.parse_args()
     run(args)
-
 
