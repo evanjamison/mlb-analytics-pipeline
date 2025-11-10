@@ -3,26 +3,18 @@
 """
 model_train_allinone.py — walk-forward training + leaderboard + optional betting fields
 
-Key robustness fixes:
-  1) Safe preprocessor: build ColumnTransformer ONLY with non-empty column lists.
-     - If no numeric OR no categoricals, we skip that branch (no SimpleImputer on empty X).
-     - If both are empty, we raise a clear error telling you which columns remained.
-  2) Safe splits: walk-forward by time (monthly or ts) with clear diagnostics.
-  3) Threshold strategies: f1 / youden / balanced.
-  4) Optional calibration: raw / platt / isotonic.
-
-Usage (PowerShell one-liner):
-  py scripts/model_train_allinone.py ^
-    --data "out\\mlb_features_prepared.csv" --date-col game_date --id-col game_pk --target home_win ^
-    --outdir "model_all_ts" --topk 25 --threshold-strategy f1 --add-rolling --add-interactions ^
-    --calibration isotonic --walkforward monthly --n-splits 6
+- Safe preprocessor (skips empty branches; errors if no features remain)
+- Safe monthly/TS splits with diagnostics and clamping
+- Threshold strategies: f1 / youden / balanced
+- Calibration: raw / platt / isotonic
+- Figures: ROC/PR (all models), reliability + confusion (best model), walk-forward AUC trend
+- HTML report: index.html inside --outdir
 """
 
 from __future__ import annotations
 
-import argparse, json, os, sys, math
+import argparse, json, os, sys
 from dataclasses import dataclass
-from datetime import datetime
 from typing import List, Tuple, Dict, Any
 
 import numpy as np
@@ -37,8 +29,10 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     roc_auc_score, accuracy_score, log_loss, brier_score_loss, f1_score,
-    precision_recall_curve, roc_curve
+    precision_recall_curve, roc_curve, confusion_matrix
 )
+import matplotlib.pyplot as plt
+
 
 # ---------------------------
 # Utilities
@@ -56,87 +50,64 @@ def _is_numeric_dtype(dtype) -> bool:
 
 def _pick_feature_cols(df: pd.DataFrame, date_col: str, id_col: str, target: str) -> List[str]:
     drop = {c for c in [date_col, id_col, target] if c in df.columns}
-    # Drop any columns that are obviously non-features we introduced earlier
-    extras = {'home_moneyline','away_moneyline'}
+    extras = {'home_moneyline','away_moneyline'}  # non-features if present
     drop |= {c for c in extras if c in df.columns}
-    cols = [c for c in df.columns if c not in drop]
-    return cols
+    return [c for c in df.columns if c not in drop]
 
 def _split_types(df: pd.DataFrame, feature_cols: List[str]) -> Tuple[List[str], List[str]]:
     num_cols, cat_cols = [], []
     for c in feature_cols:
         dt = df[c].dtype
-        if _is_numeric_dtype(dt):
-            num_cols.append(c)
-        else:
-            cat_cols.append(c)
+        (num_cols if _is_numeric_dtype(dt) else cat_cols).append(c)
     return num_cols, cat_cols
 
 def make_preprocessor(df: pd.DataFrame, feature_cols: List[str]) -> Tuple[ColumnTransformer, List[str], List[str]]:
-    """
-    Build a ColumnTransformer that is guaranteed to have no empty transformers.
-    If either branch has no columns, it is omitted. If both are empty, error.
-    """
     num_cols, cat_cols = _split_types(df, feature_cols)
     transformers = []
-    if len(num_cols) > 0:
-        num_pipe = Pipeline(
-            steps=[
-                ("imp", SimpleImputer(strategy="median")),
-                ("sc", StandardScaler(with_mean=True, with_std=True)),
-            ]
-        )
+    if num_cols:
+        num_pipe = Pipeline([
+            ("imp", SimpleImputer(strategy="median")),
+            ("sc", StandardScaler(with_mean=True, with_std=True)),
+        ])
         transformers.append(("num", num_pipe, num_cols))
-    if len(cat_cols) > 0:
-        cat_pipe = Pipeline(
-            steps=[
-                ("imp", SimpleImputer(strategy="most_frequent")),
-                ("oh", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-            ]
-        )
+    if cat_cols:
+        cat_pipe = Pipeline([
+            ("imp", SimpleImputer(strategy="most_frequent")),
+            ("oh", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ])
         transformers.append(("cat", cat_pipe, cat_cols))
-
     if not transformers:
         raise ValueError(
             "No usable feature columns after filtering.\n"
             f"Candidate columns were: {feature_cols}\n"
             "Check that at least one numeric or categorical column remains."
         )
-
-    pre = ColumnTransformer(transformers=transformers, remainder="drop")
-    return pre, num_cols, cat_cols
+    return ColumnTransformer(transformers=transformers, remainder="drop"), num_cols, cat_cols
 
 def _best_threshold(y_true: np.ndarray, p: np.ndarray, mode: str = "f1") -> float:
-    """
-    Pick a probability threshold based on strategy:
-      - f1: maximize F1 on validation
-      - youden: maximize (TPR - FPR) on ROC (Youden's J)
-      - balanced: threshold where precision ≈ recall (closest in abs difference)
-    """
     p = np.asarray(p).ravel()
     y_true = np.asarray(y_true).astype(int).ravel()
 
     if mode == "f1":
         pr, rc, thr = precision_recall_curve(y_true, p)
         f1s = 2 * (pr * rc) / np.clip(pr + rc, 1e-12, None)
-        idx = np.nanargmax(f1s)
-        # precision_recall_curve returns thresholds of length n-1
-        return float(thr[max(0, idx - 1)]) if len(thr) > 0 else 0.5
+        idx = int(np.nanargmax(f1s)) if len(f1s) else 0
+        return float(thr[max(0, idx - 1)]) if len(thr) else 0.5
 
-    elif mode == "youden":
+    if mode == "youden":
         fpr, tpr, thr = roc_curve(y_true, p)
         j = tpr - fpr
-        idx = int(np.nanargmax(j))
-        return float(thr[idx]) if idx < len(thr) else 0.5
+        idx = int(np.nanargmax(j)) if len(j) else 0
+        return float(thr[idx]) if len(thr) else 0.5
 
-    elif mode == "balanced":
+    if mode == "balanced":
         pr, rc, thr = precision_recall_curve(y_true, p)
-        # choose threshold where |precision - recall| is minimized
         diffs = np.abs(pr[:-1] - rc[:-1])
         idx = int(np.nanargmin(diffs)) if len(diffs) else 0
         return float(thr[idx]) if len(thr) else 0.5
 
     return 0.5
+
 
 @dataclass
 class FoldResult:
@@ -153,6 +124,7 @@ class FoldResult:
     acc_test: float
     threshold: float
 
+
 # ---------------------------
 # Walk-forward splits
 # ---------------------------
@@ -166,9 +138,8 @@ def _time_splits_monthly(df: pd.DataFrame, date_col: str, n_splits: int):
     df = df.assign(_mon=d.dt.to_period("M").astype(str))
     months = sorted(df["_mon"].dropna().unique().tolist())
 
-    # Clamp to max available months - 2
     if len(months) < 3:
-        print(f"[warn] Only {len(months)} distinct months in data — using single fallback split.")
+        print(f"[warn] Only {len(months)} distinct months in data — using single 70/15/15 split.")
         idx = np.arange(len(df))
         n = len(df)
         tr_end, va_end = int(n * 0.7), int(n * 0.85)
@@ -179,7 +150,7 @@ def _time_splits_monthly(df: pd.DataFrame, date_col: str, n_splits: int):
     for i in range(n_splits):
         train_months = months[: i + 1]
         valid_month = months[i + 1]
-        test_month = months[i + 2] if i + 2 < len(months) else months[-1]
+        test_month  = months[i + 2]
         tr_idx = df.index[df["_mon"].isin(train_months)].to_numpy()
         va_idx = df.index[df["_mon"] == valid_month].to_numpy()
         te_idx = df.index[df["_mon"] == test_month].to_numpy()
@@ -189,19 +160,55 @@ def _time_splits_monthly(df: pd.DataFrame, date_col: str, n_splits: int):
     return splits
 
 
-def _time_splits_progressive(df: pd.DataFrame, date_col: str, n_splits: int) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+def _time_splits_progressive(df: pd.DataFrame, date_col: str, n_splits: int):
     """
     Progressive expanding window: split the sorted index into train/valid/test blocks.
     """
     idx = np.arange(len(df))
-    blocks = np.array_split(idx, n_splits + 2)  # train blocks grow
+    blocks = np.array_split(idx, n_splits + 2)
     splits = []
     for i in range(n_splits):
-        tr = np.concatenate(blocks[: i + 1])
+        tr = np.concatenate(blocks[: i + 1]) if i > 0 else blocks[0]
         va = blocks[i + 1]
         te = blocks[i + 2] if i + 2 < len(blocks) else blocks[-1]
         splits.append((tr, va, te))
     return splits
+
+
+# ---- plotting helpers ----
+
+def _plot_roc_all(ax, curves, title="ROC — test_all"):
+    for name, (fpr, tpr) in curves.items():
+        ax.plot(fpr, tpr, label=name)
+    ax.plot([0,1],[0,1],"--",alpha=0.4)
+    ax.set_title(title); ax.set_xlabel("FPR"); ax.set_ylabel("TPR"); ax.legend()
+
+def _plot_pr_all(ax, curves, title="PR — test_all"):
+    for name, (prec, rec) in curves.items():
+        ax.plot(rec, prec, label=name)
+    ax.set_title(title); ax.set_xlabel("Recall"); ax.set_ylabel("Precision"); ax.legend()
+
+def _plot_reliability(ax, probs, y_true, bins=10, title="Reliability — best"):
+    p = np.clip(probs, 1e-6, 1-1e-6)
+    qs = np.linspace(0,1,bins+1)
+    idx = np.digitize(p, qs)-1
+    obs, pred = [], []
+    for b in range(bins):
+        m = idx==b
+        if m.sum()>0:
+            obs.append(np.mean(y_true[m]))
+            pred.append(np.mean(p[m]))
+    ax.plot([0,1],[0,1],":",color="tab:orange")
+    ax.plot(pred, obs, marker="o")
+    ax.set_title(title); ax.set_xlabel("pred prob"); ax.set_ylabel("observed")
+
+def _plot_conf(ax, y_true, y_hat, title="Confusion"):
+    cm = confusion_matrix(y_true, y_hat)
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_title(title); ax.set_xlabel("Pred"); ax.set_ylabel("True")
+    for (i,j),v in np.ndenumerate(cm):
+        ax.text(j, i, str(v), ha='center', va='center')
+
 
 # ---------------------------
 # Main training
@@ -222,41 +229,36 @@ def run(args):
     df = df.dropna(subset=[args.target]).copy()
     y = df[args.target].astype(int).values
 
-    # Choose feature columns and build a SAFE preprocessor
+    # Features + preprocessor
     feat_cols = _pick_feature_cols(df, args.date_col, args.id_col, args.target)
     pre, num_cols, cat_cols = make_preprocessor(df, feat_cols)
 
-    # Define candidate models (lightweight, sklearn-only)
+    # Candidate models
     models = [
-        ("LogReg_l2", LogisticRegression(max_iter=1000, n_jobs=None, solver="lbfgs")),
-        ("RandomForest", RandomForestClassifier(n_estimators=400, max_depth=None, n_jobs=-1, class_weight=None, random_state=42)),
-        ("GradBoost", GradientBoostingClassifier(random_state=42)),
+        ("LogReg_l2",  LogisticRegression(max_iter=1000, solver="lbfgs")),
+        ("RandomForest", RandomForestClassifier(n_estimators=400, n_jobs=-1, random_state=42)),
+        ("GradBoost",  GradientBoostingClassifier(random_state=42)),
     ]
 
-    # Calibration wrapper if requested
     def maybe_calibrate(est):
         if args.calibration == "raw":
             return est
         method = "sigmoid" if args.calibration == "platt" else "isotonic"
-        # Calibrate on validation inside fold — we’ll fit per fold
         return CalibratedClassifierCV(est, method=method, cv="prefit")
 
-    # Build walk-forward splits
+    # Splits
     if args.walkforward == "monthly":
         splits = _time_splits_monthly(df, args.date_col, args.n_splits)
     elif args.walkforward == "ts":
         splits = _time_splits_progressive(df, args.date_col, args.n_splits)
     else:
-        # Single split: 70/15/15 by order
-        n = len(df)
-        tr_end = int(n * 0.7)
-        va_end = int(n * 0.85)
-        splits = [(np.arange(0, tr_end), np.arange(tr_end, va_end), np.arange(va_end, n))]
+        n = len(df); tr_end, va_end = int(n*0.7), int(n*0.85)
+        splits = [(np.arange(0,tr_end), np.arange(tr_end,va_end), np.arange(va_end,n))]
 
     leaderboard: List[Dict[str, Any]] = []
     fold_summaries: List[FoldResult] = []
 
-    # Per-model loop across splits
+    # Train across splits
     for name, base_est in models:
         print(f"\n=== Training: {name} ===")
         model_metrics = []
@@ -264,29 +266,23 @@ def run(args):
 
         for tr_idx, va_idx, te_idx in splits:
             fold += 1
-            Xtr = df.iloc[tr_idx][feat_cols]
-            ytr = y[tr_idx]
+            Xtr = df.iloc[tr_idx][feat_cols]; ytr = y[tr_idx]
             Xva = df.iloc[va_idx][feat_cols]; yva = y[va_idx]
             Xte = df.iloc[te_idx][feat_cols]; yte = y[te_idx]
 
-            # Fit preprocessor + base estimator
             pipe = Pipeline([("pre", pre), ("clf", base_est)])
             pipe.fit(Xtr, ytr)
 
-            # Optional calibration using validation set
             clf = pipe
             if args.calibration != "raw":
-                # Transform val data once
                 Xva_tr = pipe.named_steps["pre"].transform(Xva)
                 cal = maybe_calibrate(base_est)
                 cal.fit(Xva_tr, yva)
                 clf = Pipeline([("pre", pipe.named_steps["pre"]), ("cal", cal)])
 
-            # Predict probabilities
             p_va = clf.predict_proba(Xva)[:, 1]
             p_te = clf.predict_proba(Xte)[:, 1]
 
-            # Metrics
             auc_v = float(roc_auc_score(yva, p_va)) if len(np.unique(yva)) > 1 else float("nan")
             auc_t = float(roc_auc_score(yte, p_te)) if len(np.unique(yte)) > 1 else float("nan")
             thr = _best_threshold(yva, p_va, args.threshold_strategy)
@@ -312,31 +308,24 @@ def run(args):
                 logloss_test=ll, brier_test=br, acc_test=acc, threshold=thr
             ))
 
-        # Aggregate per-model
         dfm = pd.DataFrame(model_metrics)
         agg = dfm.mean(numeric_only=True).to_dict()
         agg.update({"model": name, "folds": len(dfm)})
         leaderboard.append(agg)
+        dfm.to_csv(os.path.join(args.outdir, f"metrics_folds_{name}.csv"), index=False)
 
-        # Save per-model fold metrics
-        out_metrics_csv = os.path.join(args.outdir, f"metrics_folds_{name}.csv")
-        dfm.to_csv(out_metrics_csv, index=False)
-
-    # Leaderboard (rank by mean AUC on test, fallback to F1)
+    # Leaderboard
     lb = pd.DataFrame(leaderboard)
-    if "auc_test" in lb.columns and lb["auc_test"].notna().any():
-        lb = lb.sort_values(["auc_test","f1_test"], ascending=False)
-    else:
-        lb = lb.sort_values(["f1_test"], ascending=False)
-
-    topk = min(args.topk, len(lb))
-    lb_top = lb.head(topk).reset_index(drop=True)
+    lb = (lb.sort_values(["auc_test","f1_test"], ascending=False)
+          if "auc_test" in lb and lb["auc_test"].notna().any()
+          else lb.sort_values(["f1_test"], ascending=False))
+    lb_top = lb.head(min(args.topk, len(lb))).reset_index(drop=True)
 
     ensure_dir(args.outdir)
     lb_csv = os.path.join(args.outdir, "leaderboard.csv")
     lb_top.to_csv(lb_csv, index=False)
 
-    # Save a compact JSON report (now also includes betting flags)
+    # Report JSON
     report = {
         "data": args.data,
         "rows": int(len(df)),
@@ -359,11 +348,114 @@ def run(args):
     with open(os.path.join(args.outdir, "report.json"), "w") as f:
         json.dump(report, f, indent=2)
 
+    # ---------- Figures ----------
+    figs_dir = os.path.join(args.outdir, "figs"); ensure_dir(figs_dir)
+
+    # Re-fit once on last split for plotting
+    if len(splits):
+        tr_idx, va_idx, te_idx = splits[-1]
+        Xtr = df.iloc[tr_idx][feat_cols]; ytr = y[tr_idx]
+        Xva = df.iloc[va_idx][feat_cols]; yva = y[va_idx]
+        Xte = df.iloc[te_idx][feat_cols]; yte = y[te_idx]
+
+        roc_curves, pr_curves = {}, {}
+        best_name, best_auc = None, -1.0
+        best_probs, best_thr, best_pred = None, 0.5, None
+
+        for name, base_est in models:
+            pipe = Pipeline([("pre", pre), ("clf", base_est)])
+            pipe.fit(Xtr, ytr)
+            clf = pipe
+            if args.calibration != "raw":
+                Xva_tr = pipe.named_steps["pre"].transform(Xva)
+                method = "sigmoid" if args.calibration == "platt" else "isotonic"
+                cal = CalibratedClassifierCV(base_est, method=method, cv="prefit")
+                cal.fit(Xva_tr, yva)
+                clf = Pipeline([("pre", pipe.named_steps["pre"]), ("cal", cal)])
+
+            p_te = clf.predict_proba(Xte)[:,1]
+            fpr, tpr, _ = roc_curve(yte, p_te)
+            prec, rec, _ = precision_recall_curve(yte, p_te)
+            roc_curves[name] = (fpr, tpr)
+            pr_curves[name]  = (prec, rec)
+
+            auc_t = float(roc_auc_score(yte, p_te)) if len(np.unique(yte))>1 else float("nan")
+            if not np.isnan(auc_t) and auc_t > best_auc:
+                best_auc = auc_t
+                best_name = name
+                best_probs = p_te
+                best_thr   = _best_threshold(yva, clf.predict_proba(Xva)[:,1], args.threshold_strategy)
+                best_pred  = (p_te >= best_thr).astype(int)
+
+        # ROC all
+        fig, ax = plt.subplots(figsize=(6,5))
+        _plot_roc_all(ax, roc_curves, title="ROC — test_all")
+        fig.savefig(os.path.join(figs_dir,"roc_test_all.png"), dpi=170); plt.close(fig)
+
+        # PR all
+        fig, ax = plt.subplots(figsize=(6,5))
+        _plot_pr_all(ax, pr_curves, title="PR — test_all")
+        fig.savefig(os.path.join(figs_dir,"pr_test_all.png"), dpi=170); plt.close(fig)
+
+        # Reliability + Confusion for best model
+        if best_probs is not None:
+            fig, ax = plt.subplots(figsize=(6,5))
+            _plot_reliability(ax, best_probs, yte, title=f"Reliability — best={best_name}")
+            fig.savefig(os.path.join(figs_dir,"reliability_best.png"), dpi=170); plt.close(fig)
+
+            fig, ax = plt.subplots(figsize=(4,4))
+            _plot_conf(ax, yte, best_pred, title=f"Confusion — best={best_name} (thr={best_thr:.2f})")
+            fig.savefig(os.path.join(figs_dir,"confusion_best.png"), dpi=170); plt.close(fig)
+
+        # Walk-forward trend (if multiple splits)
+        if len(splits) > 1 and best_name is not None:
+            aucs = []
+            for (tr, va, te) in splits:
+                Xtr = df.iloc[tr][feat_cols]; ytr = y[tr]
+                Xva = df.iloc[va][feat_cols]; yva = y[va]
+                Xte = df.iloc[te][feat_cols]; yte = y[te]
+                est = [m for m in models if m[0]==best_name][0][1]
+                pipe = Pipeline([("pre", pre), ("clf", est)])
+                pipe.fit(Xtr, ytr)
+                clf = pipe
+                if args.calibration != "raw":
+                    Xva_tr = pipe.named_steps["pre"].transform(Xva)
+                    method = "sigmoid" if args.calibration == "platt" else "isotonic"
+                    cal = CalibratedClassifierCV(est, method=method, cv="prefit")
+                    cal.fit(Xva_tr, yva)
+                    clf = Pipeline([("pre", pipe.named_steps["pre"]), ("cal", cal)])
+                p_te = clf.predict_proba(Xte)[:,1]
+                aucs.append(float(roc_auc_score(yte, p_te)) if len(np.unique(yte))>1 else np.nan)
+            fig, ax = plt.subplots(figsize=(6,3))
+            ax.plot(np.arange(1,len(aucs)+1), aucs, marker="o")
+            ax.set_xlabel("split"); ax.set_ylabel("AUC"); ax.set_title(f"Walk-forward AUC — {best_name}")
+            fig.savefig(os.path.join(figs_dir,"walkforward_auc.png"), dpi=170); plt.close(fig)
+
+    # HTML index
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Model report</title></head>
+<body>
+<h1>Model report</h1>
+<ul>
+  <li><a href="leaderboard.csv">leaderboard.csv</a></li>
+  <li><a href="report.json">report.json</a></li>
+</ul>
+<h2>Figures</h2>
+<img src="figs/roc_test_all.png" style="max-width:900px;"><br>
+<img src="figs/pr_test_all.png" style="max-width:900px;"><br>
+<img src="figs/reliability_best.png" style="max-width:650px;"><br>
+<img src="figs/confusion_best.png" style="max-width:450px;"><br>
+{"<img src=\"figs/walkforward_auc.png\" style=\"max-width:700px;\">" if len(splits)>1 else ""}
+</body></html>"""
+    with open(os.path.join(args.outdir, "index.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+
     print("\n=== Leaderboard (top) ===")
     print(lb_top.head(min(10, len(lb_top))).to_string(index=False))
     print(f"\nSaved: {lb_csv}")
     print(f"Report: {os.path.join(args.outdir,'report.json')}")
     print("✅ Done.")
+
 
 # ---------------------------
 # CLI
@@ -380,7 +472,7 @@ if __name__ == "__main__":
     ap.add_argument("--topk", type=int, default=25)
     ap.add_argument("--threshold-strategy", choices=["f1","youden","balanced"], default="f1")
 
-    # Kept for CLI compatibility (no-ops in this script — feature building is upstream)
+    # kept for CLI compatibility (feature building is upstream)
     ap.add_argument("--add-rolling", action="store_true")
     ap.add_argument("--add-interactions", action="store_true")
 
@@ -388,9 +480,9 @@ if __name__ == "__main__":
     ap.add_argument("--walkforward", choices=["monthly","ts","none"], default="monthly")
     ap.add_argument("--n-splits", type=int, default=6)
 
-    # NEW: accept betting params so orchestrator can pass them without error
-    ap.add_argument("--min-edge", type=float, default=0.02, help="Minimum betting edge (default: 0.02)")
-    ap.add_argument("--kelly-cap", type=float, default=0.05, help="Kelly bet size cap (default: 0.05)")
+    # pass-through betting params (not used here, but accepted)
+    ap.add_argument("--min-edge", type=float, default=0.02)
+    ap.add_argument("--kelly-cap", type=float, default=0.05)
 
     args = ap.parse_args()
     run(args)
