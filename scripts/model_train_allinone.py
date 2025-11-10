@@ -157,16 +157,24 @@ class FoldResult:
 # Walk-forward splits
 # ---------------------------
 
-def _time_splits_monthly(df: pd.DataFrame, date_col: str, n_splits: int) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+def _time_splits_monthly(df: pd.DataFrame, date_col: str, n_splits: int):
     """
-    Split by month boundaries; last split is test. Each split advances by one month.
+    Split by month boundaries safely — automatically clamps n_splits if not enough months.
     Returns list of (train_idx, valid_idx, test_idx).
     """
     d = pd.to_datetime(df[date_col], errors="coerce")
     df = df.assign(_mon=d.dt.to_period("M").astype(str))
-    months = sorted(df["_mon"].unique().tolist())
-    if len(months) < n_splits + 2:
-        n_splits = max(1, len(months) - 2)
+    months = sorted(df["_mon"].dropna().unique().tolist())
+
+    # Clamp to max available months - 2
+    if len(months) < 3:
+        print(f"[warn] Only {len(months)} distinct months in data — using single fallback split.")
+        idx = np.arange(len(df))
+        n = len(df)
+        tr_end, va_end = int(n * 0.7), int(n * 0.85)
+        return [(idx[:tr_end], idx[tr_end:va_end], idx[va_end:])]
+
+    n_splits = min(n_splits, len(months) - 2)
     splits = []
     for i in range(n_splits):
         train_months = months[: i + 1]
@@ -176,7 +184,10 @@ def _time_splits_monthly(df: pd.DataFrame, date_col: str, n_splits: int) -> List
         va_idx = df.index[df["_mon"] == valid_month].to_numpy()
         te_idx = df.index[df["_mon"] == test_month].to_numpy()
         splits.append((tr_idx, va_idx, te_idx))
+
+    print(f"[diag] Generated {len(splits)} monthly splits from {len(months)} months.")
     return splits
+
 
 def _time_splits_progressive(df: pd.DataFrame, date_col: str, n_splits: int) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
