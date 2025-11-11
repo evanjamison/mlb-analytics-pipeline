@@ -63,31 +63,43 @@ jobs:
           echo "GITHUB_SHA: $GITHUB_SHA"
           echo "Branch: $GITHUB_REF_NAME"
 
-          # Show the orchestrator section for quick debugging
           echo "---- Orchestrator snippet (lines 140-220) ----"
           sed -n '140,220p' .github/workflows/pipeline.yml || true
           echo "---------------------------------------------"
 
-          # Fail ONLY if --backfill-days appears on the same line as run_pipeline.py
           if grep -nE 'python[[:space:]]+scripts/run_pipeline\.py([^#\n]*)--backfill-days' .github/workflows/pipeline.yml; then
             echo "::error::Found legacy --backfill-days on run_pipeline.py invocation. Use --ingest-backfill-days/--feature-backfill-days/--max-update-days instead."
             exit 3
           fi
           echo "OK: no legacy --backfill-days on run_pipeline.py."
-
           python --version
 
-      # 4) Orchestrator (with 30-day cap)
+      # 4) Orchestrator (uses your 2024 base CSV)
       - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
         shell: bash
         run: |
           set -euo pipefail
+
+          BASE_2024="out/mlb_features_full_20240328_to_20240929.csv"
+          COMBINED="out/mlb_features_combined.csv"
+
+          # Sanity check the base dataset exists
+          if [[ ! -f "$BASE_2024" ]]; then
+            echo "::error::Expected 2024 base CSV not found at: $BASE_2024"
+            echo "Contents of out_backup/:"
+            ls -la out_backup || true
+            exit 2
+          fi
+
+          mkdir -p out
 
           if [[ -f scripts/run_pipeline.py ]]; then
             echo ">> scripts/run_pipeline.py detected — running orchestrator"
             python scripts/run_pipeline.py \
               --pybin python \
               --base-year 2024 \
+              --features-base "$BASE_2024" \
+              --features-combined "$COMBINED" \
               --ingest-backfill-days 80 \
               --feature-backfill-days 80 \
               --max-update-days 80 \
@@ -96,10 +108,9 @@ jobs:
               --add-interactions
           else
             echo ">> No orchestrator found — using manual build/train flow"
-            mkdir -p out
             success=0
 
-            # Last 30 days via your ingest (allowed to use --backfill-days here)
+            # Last 30 days via ingest (ok to use --backfill-days here)
             if python scripts/data_ingest.py --year 2025 --backfill-days 30 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
               success=1
             fi
@@ -115,7 +126,7 @@ jobs:
             fi
 
             if [[ $success -eq 0 ]]; then
-              echo "ERROR: No features CSV produced by data_ingest."
+              echo "::error::No features CSV produced by data_ingest."
               exit 2
             fi
 
@@ -134,7 +145,7 @@ jobs:
               --n-splits 6
           fi
 
-      # 5) Artifacts (always try; warnings OK if nothing produced on failure)
+      # 5) Artifacts
       - name: Upload artifacts (reports + datasets)
         if: always()
         uses: actions/upload-artifact@v4
@@ -160,7 +171,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "CI: 30-day capped update + retrain"
+            git commit -m "CI: update using 2024 base CSV + 80-day window"
             git push
           fi
 
