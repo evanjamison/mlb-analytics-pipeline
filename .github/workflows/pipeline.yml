@@ -11,7 +11,7 @@ permissions:
 jobs:
   update-train:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 700
 
     steps:
       # 1) Checkout
@@ -88,9 +88,9 @@ jobs:
             python scripts/run_pipeline.py \
               --pybin python \
               --base-year 2024 \
-              --ingest-backfill-days 100 \
-              --feature-backfill-days 100 \
-              --max-update-days 100 \
+              --ingest-backfill-days 80 \
+              --feature-backfill-days 80 \
+              --max-update-days 80 \
               --run-eda \
               --add-rolling \
               --add-interactions
