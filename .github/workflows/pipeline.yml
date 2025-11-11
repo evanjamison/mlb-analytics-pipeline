@@ -74,23 +74,34 @@ jobs:
           echo "OK: no legacy --backfill-days on run_pipeline.py."
           python --version
 
-      # 4) Orchestrator (uses your 2024 base CSV)
+      # 4) Orchestrator (auto-detects your 2024 base CSV)
       - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
         shell: bash
         run: |
           set -euo pipefail
 
-          BASE_2024="out/mlb_features_full_20240328_to_20240929.csv"
-          COMBINED="out/mlb_features_combined.csv"
+          # Try both locations for the 2024 base CSV
+          CANDIDATES=(
+            "out/mlb_features_full_20240328_to_20240929.csv"
+            "out_backup/mlb_features_full_20240328_to_20240929.csv"
+          )
 
-          # Sanity check the base dataset exists
-          if [[ ! -f "$BASE_2024" ]]; then
-            echo "::error::Expected 2024 base CSV not found at: $BASE_2024"
+          BASE_2024=""
+          for p in "${CANDIDATES[@]}"; do
+            if [[ -f "$p" ]]; then BASE_2024="$p"; break; fi
+          done
+
+          if [[ -z "${BASE_2024:-}" ]]; then
+            echo "::error::Could not find 2024 base CSV in either:"
+            printf '  - %s\n' "${CANDIDATES[@]}"
+            echo "Contents of out/:"
+            ls -la out || true
             echo "Contents of out_backup/:"
             ls -la out_backup || true
             exit 2
           fi
 
+          COMBINED="out/mlb_features_combined.csv"
           mkdir -p out
 
           if [[ -f scripts/run_pipeline.py ]]; then
@@ -110,7 +121,7 @@ jobs:
             echo ">> No orchestrator found — using manual build/train flow"
             success=0
 
-            # Last 30 days via ingest (ok to use --backfill-days here)
+            # Last 30 days via ingest (OK to use --backfill-days here)
             if python scripts/data_ingest.py --year 2025 --backfill-days 30 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
               success=1
             fi
@@ -198,3 +209,4 @@ jobs:
               <li><b>Started (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
             <p>Check the run logs and downloaded artifacts (mlb-artifacts) for details.</p>
+
