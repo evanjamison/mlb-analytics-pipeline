@@ -55,18 +55,14 @@ jobs:
             pip install --upgrade "pybaseball>=2.2.7" || true
           fi
 
-      # Guard: only block legacy flag if it's on the run_pipeline.py line
+      # 4) Guard (only block legacy flag if it's on run_pipeline.py line)
       - name: Guard legacy flag only on run_pipeline.py
         shell: bash
         run: |
           set -euo pipefail
           echo "GITHUB_SHA: $GITHUB_SHA"
           echo "Branch: $GITHUB_REF_NAME"
-
-          echo "---- Orchestrator snippet (lines 140-220) ----"
           sed -n '140,220p' .github/workflows/pipeline.yml || true
-          echo "---------------------------------------------"
-
           if grep -nE 'python[[:space:]]+scripts/run_pipeline\.py([^#\n]*)--backfill-days' .github/workflows/pipeline.yml; then
             echo "::error::Found legacy --backfill-days on run_pipeline.py invocation. Use --ingest-backfill-days/--feature-backfill-days/--max-update-days instead."
             exit 3
@@ -74,89 +70,82 @@ jobs:
           echo "OK: no legacy --backfill-days on run_pipeline.py."
           python --version
 
-      # 4) Orchestrator (auto-detects your 2024 base CSV)
-      - name: Run orchestrator (run_pipeline.py) or fallback to manual build/train
+      # 5) Seed/merge base → combined (first-run safe)
+      - name: Seed or merge 2024 base into combined
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p out
 
-          # Try both locations for the 2024 base CSV
+          # Try both locations for your 2024 base CSV
           CANDIDATES=(
             "out/mlb_features_full_20240328_to_20240929.csv"
             "out_backup/mlb_features_full_20240328_to_20240929.csv"
           )
-
           BASE_2024=""
           for p in "${CANDIDATES[@]}"; do
             if [[ -f "$p" ]]; then BASE_2024="$p"; break; fi
           done
 
           if [[ -z "${BASE_2024:-}" ]]; then
-            echo "::error::Could not find 2024 base CSV in either:"
-            printf '  - %s\n' "${CANDIDATES[@]}"
-            echo "Contents of out/:"
-            ls -la out || true
-            echo "Contents of out_backup/:"
-            ls -la out_backup || true
-            exit 2
-          fi
-
-          COMBINED="out/mlb_features_combined.csv"
-          mkdir -p out
-
-          if [[ -f scripts/run_pipeline.py ]]; then
-            echo ">> scripts/run_pipeline.py detected — running orchestrator"
-            python scripts/run_pipeline.py \
-              --pybin python \
-              --base-year 2024 \
-              --features-base "$BASE_2024" \
-              --features-combined "$COMBINED" \
-              --ingest-backfill-days 80 \
-              --feature-backfill-days 80 \
-              --max-update-days 80 \
-              --run-eda \
-              --add-rolling \
-              --add-interactions
+            echo "::warning::2024 base CSV not found in out/ or out_backup/. Continuing without base."
           else
-            echo ">> No orchestrator found — using manual build/train flow"
-            success=0
-
-            # Last 30 days via ingest (OK to use --backfill-days here)
-            if python scripts/data_ingest.py --year 2025 --backfill-days 30 --build-features --out out/mlb_features_prepared.csv 2>/dev/null; then
-              success=1
+            echo "Found base at: $BASE_2024"
+            # If combined is missing, start it with base; otherwise merge + dedup
+            if [[ ! -f out/mlb_features_combined.csv ]]; then
+              cp "$BASE_2024" out/mlb_features_combined.csv
+            else
+              python - <<'PY'
+import pandas as pd, sys
+base="__BASE__"
+comb="out/mlb_features_combined.csv"
+dfb=pd.read_csv(base, parse_dates=["game_date"], low_memory=False)
+dfc=pd.read_csv(comb, parse_dates=["game_date"], low_memory=False)
+cols=sorted(set(dfb.columns).union(dfc.columns))
+dfb=dfb.reindex(columns=cols)
+dfc=dfc.reindex(columns=cols)
+out=pd.concat([dfb, dfc], ignore_index=True)
+if "game_pk" in out.columns:
+    out=out.sort_values(["game_date","game_pk"]).drop_duplicates("game_pk", keep="last")
+else:
+    out=out.drop_duplicates()
+out=out.sort_values("game_date")
+out.to_csv(comb, index=False)
+print(f"[merge] combined rows: {len(out):,}")
+PY
+            | sed "s|__BASE__|$BASE_2024|"
             fi
-
-            if [[ $success -eq 0 ]]; then
-              if python scripts/data_ingest.py --year 2025 --backfill-days 30 --all --out out 2>/dev/null; then
-                found="$(ls -1 out/mlb_features_*prepared*.csv 2>/dev/null | head -n1 || true)"
-                if [[ -n "$found" ]]; then
-                  cp "$found" out/mlb_features_prepared.csv
-                  success=1
-                fi
-              fi
-            fi
-
-            if [[ $success -eq 0 ]]; then
-              echo "::error::No features CSV produced by data_ingest."
-              exit 2
-            fi
-
-            python scripts/model_train_allinone.py \
-              --data "out/mlb_features_prepared.csv" \
-              --date-col game_date \
-              --id-col game_pk \
-              --target home_win \
-              --outdir "model_all_ts" \
-              --topk 25 \
-              --threshold-strategy f1 \
-              --add-rolling \
-              --add-interactions \
-              --calibration isotonic \
-              --walkforward ts \
-              --n-splits 6
           fi
 
-      # 5) Artifacts
+          # Ensure a minimal combined exists for later steps
+          if [[ ! -f out/mlb_features_combined.csv ]]; then
+            echo "[init] Creating empty combined as fallback"
+            python - <<'PY'
+import pandas as pd
+pd.DataFrame(columns=["game_date","game_pk","home_win"]).to_csv("out/mlb_features_combined.csv", index=False)
+PY
+          fi
+
+      # 6) Run orchestrator (incremental update on top of combined)
+      - name: Run orchestrator (run_pipeline.py)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/run_pipeline.py \
+            --pybin python \
+            --base-year 2024 \
+            --features-base "out/mlb_features_full_20240328_to_20240929.csv" \
+            --features-combined "out/mlb_features_combined.csv" \
+            --prepared "out/mlb_features_prepared.csv" \
+            --model-out "model_all_ts" \
+            --ingest-backfill-days 80 \
+            --feature-backfill-days 80 \
+            --max-update-days 80 \
+            --run-eda \
+            --add-rolling \
+            --add-interactions
+
+      # 7) Artifacts
       - name: Upload artifacts (reports + datasets)
         if: always()
         uses: actions/upload-artifact@v4
@@ -171,7 +160,7 @@ jobs:
             model_out/**/*
             model_all_ts/**/*
 
-      # 6) Commit any changes
+      # 8) Commit any changes
       - name: Commit results (if changed)
         if: success()
         shell: bash
@@ -182,11 +171,11 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "CI: update using 2024 base CSV + 80-day window"
+            git commit -m "CI: merge 2024 base + incremental update + retrain"
             git push
           fi
 
-      # 7) Email on failure
+      # 9) Email on failure
       - name: Send failure email
         if: failure()
         uses: dawidd6/action-send-mail@v3
@@ -195,7 +184,7 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "❌ MLB pipeline FAILED — ${{ github.repository }} #${{ github.run_number }}"
+          subject: "❌ MLB pipeline FAILED — ${{ github.repository }} #${{ github.run_number }} (main)"
           to: ${{ secrets.ALERT_TO }}
           from: ${{ secrets.ALERT_FROM }}
           secure: true

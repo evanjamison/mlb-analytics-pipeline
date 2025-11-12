@@ -3,17 +3,18 @@
 """
 model_train_allinone.py — walk-forward training + leaderboard + optional betting fields
 
+- Models: LogReg (L2), ElasticNet (saga), RandomForest, ExtraTrees, GradBoost, LightGBM (if installed)
 - Safe preprocessor (skips empty branches; errors if no features remain)
 - Safe monthly/TS splits with diagnostics and clamping
 - Threshold strategies: f1 / youden / balanced
 - Calibration: raw / platt / isotonic
-- Figures: ROC/PR (all models), reliability + confusion (best model), walk-forward AUC trend
+- Figures: ROC/PR (all), Reliability + Confusion (best), Walk-forward AUC
 - HTML report: index.html inside --outdir
 """
 
 from __future__ import annotations
 
-import argparse, json, os, sys
+import argparse, json, os
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
 
@@ -25,13 +26,24 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    ExtraTreesClassifier,
+    GradientBoostingClassifier,
+)
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     roc_auc_score, accuracy_score, log_loss, brier_score_loss, f1_score,
     precision_recall_curve, roc_curve, confusion_matrix
 )
 import matplotlib.pyplot as plt
+
+# Optional LightGBM
+try:
+    from lightgbm import LGBMClassifier
+    _HAS_LGBM = True
+except Exception:
+    _HAS_LGBM = False
 
 
 # ---------------------------
@@ -130,10 +142,6 @@ class FoldResult:
 # ---------------------------
 
 def _time_splits_monthly(df: pd.DataFrame, date_col: str, n_splits: int):
-    """
-    Split by month boundaries safely — automatically clamps n_splits if not enough months.
-    Returns list of (train_idx, valid_idx, test_idx).
-    """
     d = pd.to_datetime(df[date_col], errors="coerce")
     df = df.assign(_mon=d.dt.to_period("M").astype(str))
     months = sorted(df["_mon"].dropna().unique().tolist())
@@ -161,9 +169,6 @@ def _time_splits_monthly(df: pd.DataFrame, date_col: str, n_splits: int):
 
 
 def _time_splits_progressive(df: pd.DataFrame, date_col: str, n_splits: int):
-    """
-    Progressive expanding window: split the sorted index into train/valid/test blocks.
-    """
     idx = np.arange(len(df))
     blocks = np.array_split(idx, n_splits + 2)
     splits = []
@@ -178,8 +183,8 @@ def _time_splits_progressive(df: pd.DataFrame, date_col: str, n_splits: int):
 # ---- plotting helpers ----
 
 def _plot_roc_all(ax, curves, title="ROC — test_all"):
-    for name, (fpr, tpr) in curves.items():
-        ax.plot(fpr, tpr, label=name)
+    for name, (fpr, tpr, auc_) in curves.items():
+        ax.plot(fpr, tpr, label=f"{name} (AUC={auc_:.3f})")
     ax.plot([0,1],[0,1],"--",alpha=0.4)
     ax.set_title(title); ax.set_xlabel("FPR"); ax.set_ylabel("TPR"); ax.legend()
 
@@ -204,10 +209,30 @@ def _plot_reliability(ax, probs, y_true, bins=10, title="Reliability — best"):
 
 def _plot_conf(ax, y_true, y_hat, title="Confusion"):
     cm = confusion_matrix(y_true, y_hat)
-    im = ax.imshow(cm, cmap="Blues")
+    ax.imshow(cm, cmap="Blues")
     ax.set_title(title); ax.set_xlabel("Pred"); ax.set_ylabel("True")
     for (i,j),v in np.ndenumerate(cm):
         ax.text(j, i, str(v), ha='center', va='center')
+
+
+# ---------------------------
+# Models
+# ---------------------------
+
+def _model_list():
+    models = [
+        ("logreg",  LogisticRegression(max_iter=2000, solver="lbfgs")),
+        ("elastic", LogisticRegression(max_iter=3000, solver="saga", penalty="elasticnet", l1_ratio=0.5)),
+        ("rf",      RandomForestClassifier(n_estimators=600, n_jobs=-1, random_state=42)),
+        ("et",      ExtraTreesClassifier(n_estimators=700, n_jobs=-1, random_state=42)),
+        ("gb",      GradientBoostingClassifier(random_state=42)),
+    ]
+    if _HAS_LGBM:
+        models.append(("lgbm", LGBMClassifier(
+            n_estimators=1200, learning_rate=0.03, subsample=0.9, colsample_bytree=0.9,
+            max_depth=-1, random_state=42, n_jobs=-1
+        )))
+    return models
 
 
 # ---------------------------
@@ -234,11 +259,7 @@ def run(args):
     pre, num_cols, cat_cols = make_preprocessor(df, feat_cols)
 
     # Candidate models
-    models = [
-        ("LogReg_l2",  LogisticRegression(max_iter=1000, solver="lbfgs")),
-        ("RandomForest", RandomForestClassifier(n_estimators=400, n_jobs=-1, random_state=42)),
-        ("GradBoost",  GradientBoostingClassifier(random_state=42)),
-    ]
+    models = _model_list()
 
     def maybe_calibrate(est):
         if args.calibration == "raw":
@@ -256,16 +277,13 @@ def run(args):
         splits = [(np.arange(0,tr_end), np.arange(tr_end,va_end), np.arange(va_end,n))]
 
     leaderboard: List[Dict[str, Any]] = []
-    fold_summaries: List[FoldResult] = []
 
     # Train across splits
     for name, base_est in models:
         print(f"\n=== Training: {name} ===")
         model_metrics = []
-        fold = 0
 
-        for tr_idx, va_idx, te_idx in splits:
-            fold += 1
+        for fold, (tr_idx, va_idx, te_idx) in enumerate(splits, start=1):
             Xtr = df.iloc[tr_idx][feat_cols]; ytr = y[tr_idx]
             Xva = df.iloc[va_idx][feat_cols]; yva = y[va_idx]
             Xte = df.iloc[te_idx][feat_cols]; yte = y[te_idx]
@@ -288,25 +306,17 @@ def run(args):
             thr = _best_threshold(yva, p_va, args.threshold_strategy)
             yhat_t = (p_te >= thr).astype(int)
 
-            ll = float(log_loss(yte, np.clip(p_te, 1e-6, 1 - 1e-6)))
-            br = float(brier_score_loss(yte, p_te))
-            acc = float(accuracy_score(yte, yhat_t))
-            f1t = float(f1_score(yte, yhat_t)) if len(np.unique(yte)) > 1 else float("nan")
-            f1v = float(f1_score(yva, (p_va >= thr).astype(int))) if len(np.unique(yva)) > 1 else float("nan")
-
             model_metrics.append({
                 "fold": fold, "model": name,
                 "train_rows": int(len(tr_idx)), "valid_rows": int(len(va_idx)), "test_rows": int(len(te_idx)),
                 "auc_valid": auc_v, "auc_test": auc_t,
-                "f1_valid": f1v, "f1_test": f1t,
-                "logloss_test": ll, "brier_test": br, "acc_test": acc, "threshold": thr
+                "f1_valid": float(f1_score(yva, (p_va >= thr).astype(int))) if len(np.unique(yva)) > 1 else float("nan"),
+                "f1_test": float(f1_score(yte, yhat_t)) if len(np.unique(yte)) > 1 else float("nan"),
+                "logloss_test": float(log_loss(yte, np.clip(p_te, 1e-6, 1 - 1e-6))),
+                "brier_test": float(brier_score_loss(yte, p_te)),
+                "acc_test": float(accuracy_score(yte, yhat_t)),
+                "threshold": float(thr),
             })
-
-            fold_summaries.append(FoldResult(
-                fold_idx=fold, train_rows=len(tr_idx), valid_rows=len(va_idx), test_rows=len(te_idx),
-                auc_valid=auc_v, auc_test=auc_t, f1_valid=f1v, f1_test=f1t,
-                logloss_test=ll, brier_test=br, acc_test=acc, threshold=thr
-            ))
 
         dfm = pd.DataFrame(model_metrics)
         agg = dfm.mean(numeric_only=True).to_dict()
@@ -376,10 +386,11 @@ def run(args):
             p_te = clf.predict_proba(Xte)[:,1]
             fpr, tpr, _ = roc_curve(yte, p_te)
             prec, rec, _ = precision_recall_curve(yte, p_te)
-            roc_curves[name] = (fpr, tpr)
+            auc_t = float(roc_auc_score(yte, p_te)) if len(np.unique(yte))>1 else float("nan")
+
+            roc_curves[name] = (fpr, tpr, auc_t)
             pr_curves[name]  = (prec, rec)
 
-            auc_t = float(roc_auc_score(yte, p_te)) if len(np.unique(yte))>1 else float("nan")
             if not np.isnan(auc_t) and auc_t > best_auc:
                 best_auc = auc_t
                 best_name = name
@@ -431,9 +442,8 @@ def run(args):
             ax.set_xlabel("split"); ax.set_ylabel("AUC"); ax.set_title(f"Walk-forward AUC — {best_name}")
             fig.savefig(os.path.join(figs_dir,"walkforward_auc.png"), dpi=170); plt.close(fig)
 
-    # HTML index (build without f-strings to avoid backslash-in-expression issues)
+    # HTML index (no f-strings with backslashes)
     walk_tag = '<img src="figs/walkforward_auc.png" style="max-width:700px;">' if len(splits) > 1 else ''
-
     html = (
         "<!doctype html>\n"
         "<html><head><meta charset='utf-8'><title>Model report</title></head>\n"
@@ -453,7 +463,6 @@ def run(args):
     )
     with open(os.path.join(args.outdir, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
-
 
     print("\n=== Leaderboard (top) ===")
     print(lb_top.head(min(10, len(lb_top))).to_string(index=False))
@@ -491,4 +500,3 @@ if __name__ == "__main__":
 
     args = ap.parse_args()
     run(args)
-
