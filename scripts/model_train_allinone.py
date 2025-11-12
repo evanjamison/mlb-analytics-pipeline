@@ -431,24 +431,29 @@ def run(args):
             ax.set_xlabel("split"); ax.set_ylabel("AUC"); ax.set_title(f"Walk-forward AUC — {best_name}")
             fig.savefig(os.path.join(figs_dir,"walkforward_auc.png"), dpi=170); plt.close(fig)
 
-    # HTML index
-    html = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Model report</title></head>
-<body>
-<h1>Model report</h1>
-<ul>
-  <li><a href="leaderboard.csv">leaderboard.csv</a></li>
-  <li><a href="report.json">report.json</a></li>
-</ul>
-<h2>Figures</h2>
-<img src="figs/roc_test_all.png" style="max-width:900px;"><br>
-<img src="figs/pr_test_all.png" style="max-width:900px;"><br>
-<img src="figs/reliability_best.png" style="max-width:650px;"><br>
-<img src="figs/confusion_best.png" style="max-width:450px;"><br>
-{"<img src=\"figs/walkforward_auc.png\" style=\"max-width:700px;\">" if len(splits)>1 else ""}
-</body></html>"""
+    # HTML index (build without f-strings to avoid backslash-in-expression issues)
+    walk_tag = '<img src="figs/walkforward_auc.png" style="max-width:700px;">' if len(splits) > 1 else ''
+
+    html = (
+        "<!doctype html>\n"
+        "<html><head><meta charset='utf-8'><title>Model report</title></head>\n"
+        "<body>\n"
+        "<h1>Model report</h1>\n"
+        "<ul>\n"
+        '  <li><a href="leaderboard.csv">leaderboard.csv</a></li>\n'
+        '  <li><a href="report.json">report.json</a></li>\n'
+        "</ul>\n"
+        "<h2>Figures</h2>\n"
+        '<img src="figs/roc_test_all.png" style="max-width:900px;"><br>\n'
+        '<img src="figs/pr_test_all.png" style="max-width:900px;"><br>\n'
+        '<img src="figs/reliability_best.png" style="max-width:650px;"><br>\n'
+        '<img src="figs/confusion_best.png" style="max-width:450px;"><br>\n'
+        + walk_tag + "\n"
+        "</body></html>"
+    )
     with open(os.path.join(args.outdir, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
+
 
     print("\n=== Leaderboard (top) ===")
     print(lb_top.head(min(10, len(lb_top))).to_string(index=False))
