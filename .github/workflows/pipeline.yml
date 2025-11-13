@@ -95,34 +95,45 @@ jobs:
             if [[ ! -f out/mlb_features_combined.csv ]]; then
               cp "$BASE_2024" out/mlb_features_combined.csv
             else
-              python - <<'PY'
-import pandas as pd, sys
-base="__BASE__"
-comb="out/mlb_features_combined.csv"
-dfb=pd.read_csv(base, parse_dates=["game_date"], low_memory=False)
-dfc=pd.read_csv(comb, parse_dates=["game_date"], low_memory=False)
-cols=sorted(set(dfb.columns).union(dfc.columns))
-dfb=dfb.reindex(columns=cols)
-dfc=dfc.reindex(columns=cols)
-out=pd.concat([dfb, dfc], ignore_index=True)
+              export BASE_2024   # pass to Python via env
+              python - << 'PY'
+import os
+import pandas as pd
+
+base = os.environ["BASE_2024"]
+comb = "out/mlb_features_combined.csv"
+
+dfb = pd.read_csv(base, parse_dates=["game_date"], low_memory=False)
+dfc = pd.read_csv(comb, parse_dates=["game_date"], low_memory=False)
+
+cols = sorted(set(dfb.columns).union(dfc.columns))
+dfb = dfb.reindex(columns=cols)
+dfc = dfc.reindex(columns=cols)
+
+out = pd.concat([dfb, dfc], ignore_index=True)
 if "game_pk" in out.columns:
-    out=out.sort_values(["game_date","game_pk"]).drop_duplicates("game_pk", keep="last")
+    out = (
+        out.sort_values(["game_date", "game_pk"])
+           .drop_duplicates("game_pk", keep="last")
+    )
 else:
-    out=out.drop_duplicates()
-out=out.sort_values("game_date")
+    out = out.drop_duplicates()
+
+out = out.sort_values("game_date")
 out.to_csv(comb, index=False)
 print(f"[merge] combined rows: {len(out):,}")
 PY
-            | sed "s|__BASE__|$BASE_2024|"
             fi
           fi
 
           # Ensure a minimal combined exists for later steps
           if [[ ! -f out/mlb_features_combined.csv ]]; then
             echo "[init] Creating empty combined as fallback"
-            python - <<'PY'
+            python - << 'PY'
 import pandas as pd
-pd.DataFrame(columns=["game_date","game_pk","home_win"]).to_csv("out/mlb_features_combined.csv", index=False)
+pd.DataFrame(
+    columns=["game_date", "game_pk", "home_win"]
+).to_csv("out/mlb_features_combined.csv", index=False)
 PY
           fi
 
@@ -198,4 +209,5 @@ PY
               <li><b>Started (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
             <p>Check the run logs and downloaded artifacts (mlb-artifacts) for details.</p>
+
 
