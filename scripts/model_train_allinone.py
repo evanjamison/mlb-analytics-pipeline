@@ -63,35 +63,69 @@ def _is_numeric_dtype(dtype) -> bool:
 
 
 # --- Anti-leak helpers ---
+
+# More targeted patterns: focus on explicit scores / final outcomes / status
 LEAKY_PATTERNS = [
-    r"\bscore\b", r"\bscores\b", r"\bruns?\b", r"\bfinal\b", r"\bresult\b",
-    r"\bw(inner|ins?)?\b", r"\bl(oser|oss|oses)?\b",
-    r"\bwin_prob(ability)?\b", r"\bwp\b", r"\blp\b", r"\bsave(s)?\b", r"\bblown\b",
-    r"\b(outcome|decision)\b", r"\bstatus\b", r"\bgame_state\b",
-    r"\bpost(game)?\b", r"\bafter_", r"^post_", r"^after_",
-    r"\bhome_score\b", r"\baway_score\b",
-    r"\bhome_runs\b", r"\baway_runs\b",
+    r"(^|_)(home|away)_score($|_)",      # home_score, away_score, etc.
+    r"(^|_)(home|away)_runs($|_)",       # home_runs, away_runs, etc.
+    r"\bfinal(_score)?\b",
+    r"\bresult\b",
+    r"\bwin_prob(ability)?\b",
+    r"\bwp\b",
+    r"\blp\b",
+    r"\bsave(s)?\b",
+    r"\bblown\b",
+    r"\b(outcome|decision)\b",
+    r"\bstatus\b",
+    r"\bgame_state\b",
+    r"\bpost(game)?\b",
+    r"^post_",
+    r"after_",                           # any "after_" features
 ]
 LEAKY_REGEX = re.compile("|".join(LEAKY_PATTERNS), flags=re.IGNORECASE)
 
 # columns we never train on
 ALWAYS_DROP = {
-    "game_date", "game_datetime", "game_pk", "home_win",  # labels/ids/timestamps
-    "home_moneyline", "away_moneyline",                   # exclude odds by default
+    "game_date", "game_datetime", "game_pk", "home_win",      # labels/ids/timestamps
+    "home_moneyline", "away_moneyline",                       # exclude odds by default
+    "_runs",                                                  # raw scoreboard total runs (post-game)
 }
 
 def _is_leaky(col: str) -> bool:
-    return bool(LEAKY_REGEX.search(col or ""))
+    """
+    Return True if a column name looks post-game / outcome-related.
+
+    We also hard-whitelist some known safe patterns that contain 'run' etc:
+    - 'rundiff'   (rolling run differential features)
+    - 'runfactor' (park factor)
+    - 'closeravail' (bullpen availability flag)
+    """
+    lower = (col or "").lower()
+
+    # Hard whitelist for known good features that contain "run"/"closer"
+    if any(key in lower for key in ("rundiff", "runfactor", "closeravail")):
+        return False
+
+    return bool(LEAKY_REGEX.search(lower))
+
 
 def _pick_feature_cols(df: pd.DataFrame, date_col: str, id_col: str, target: str) -> List[str]:
+    # Base drops: ids, target, odds, timestamps, and any ALWAYS_DROP that happen to exist
     drop = set([date_col, id_col, target]) | ALWAYS_DROP.intersection(df.columns)
+
     candidates = [c for c in df.columns if c not in drop]
+
+    # Detect leaky-looking cols
     leaky = [c for c in candidates if _is_leaky(c)]
     if leaky:
         print(f"[anti-leak] Excluding {len(leaky)} leaky columns: {leaky}")
+
     safe = [c for c in candidates if c not in leaky]
     if not safe:
-        raise ValueError("After anti-leak filtering no feature columns remain. Inspect your prepared dataset.")
+        raise ValueError(
+            "After anti-leak filtering no feature columns remain. "
+            "Inspect your prepared dataset and column naming."
+        )
     return safe
 
 
@@ -286,7 +320,8 @@ def run(args):
     # Anti-leak dataset audit (warning only)
     sus = [c for c in df.columns if _is_leaky(c)]
     if sus:
-        print(f"[anti-leak][WARN] Dataset contains leaky-looking columns present in file: {sus}  (they will be excluded from features)")
+        print(f"[anti-leak][WARN] Dataset contains leaky-looking columns present in file: {sus} "
+              "(they will be excluded from features if not whitelisted).")
 
     # Features + preprocessor
     feat_cols = _pick_feature_cols(df, args.date_col, args.id_col, args.target)
