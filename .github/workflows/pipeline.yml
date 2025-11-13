@@ -94,31 +94,14 @@ jobs:
             cp "$BASE_2024" out/mlb_features_combined.csv
           else
             echo "Merging base into existing combined from: $BASE_2024"
-            export BASE_2024
-            python -c "import os,pandas as pd; \
-base = os.environ['BASE_2024']; \
-comb = 'out/mlb_features_combined.csv'; \
-dfb = pd.read_csv(base, parse_dates=['game_date'], low_memory=False); \
-dfc = pd.read_csv(comb, parse_dates=['game_date'], low_memory=False); \
-cols = sorted(set(dfb.columns).union(dfc.columns)); \
-dfb = dfb.reindex(columns=cols); \
-dfc = dfc.reindex(columns=cols); \
-out = pd.concat([dfb, dfc], ignore_index=True); \
-import numpy as np; \
-out = (out.sort_values(['game_date','game_pk']).drop_duplicates('game_pk', keep='last') \
-       if 'game_pk' in out.columns else out.drop_duplicates()); \
-out = out.sort_values('game_date'); \
-out.to_csv(comb, index=False); \
-print('[merge] combined rows:', len(out))"
+            python scripts/merge_base_into_combined.py "$BASE_2024" "out/mlb_features_combined.csv"
           fi
 
           # Ensure a minimal combined exists for later steps
           if [[ ! -f out/mlb_features_combined.csv ]]; then
             echo "[init] Creating empty combined as fallback"
-            python -c "import pandas as pd; \
-pd.DataFrame(columns=['game_date','game_pk','home_win']).to_csv('out/mlb_features_combined.csv', index=False)"
+            python -c "import pandas as pd; pd.DataFrame(columns=['game_date','game_pk','home_win']).to_csv('out/mlb_features_combined.csv', index=False)"
           fi
-
 
       # 6) Run orchestrator (incremental update on top of combined)
       - name: Run orchestrator (run_pipeline.py)
@@ -192,6 +175,7 @@ pd.DataFrame(columns=['game_date','game_pk','home_win']).to_csv('out/mlb_feature
               <li><b>Started (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
             <p>Check the run logs and downloaded artifacts (mlb-artifacts) for details.</p>
+
 
 
 
