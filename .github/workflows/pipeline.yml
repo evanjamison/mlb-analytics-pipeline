@@ -91,11 +91,12 @@ jobs:
             echo "::warning::2024 base CSV not found in out/ or out_backup/. Continuing without base."
           else
             echo "Found base at: $BASE_2024"
+
             # If combined is missing, start it with base; otherwise merge + dedup
             if [[ ! -f out/mlb_features_combined.csv ]]; then
               cp "$BASE_2024" out/mlb_features_combined.csv
             else
-              export BASE_2024   # pass to Python via env
+              export BASE_2024  # pass to Python via env
               python - << 'PY'
 import os
 import pandas as pd
@@ -209,5 +210,6 @@ PY
               <li><b>Started (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
             <p>Check the run logs and downloaded artifacts (mlb-artifacts) for details.</p>
+
 
 
