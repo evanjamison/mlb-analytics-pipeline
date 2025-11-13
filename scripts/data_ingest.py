@@ -2015,6 +2015,63 @@ def add_travel_schedule_load(games: pd.DataFrame) -> pd.DataFrame:
     df['ThreeInThree_diff']   = df['home_team_name_3in3'] - df['away_team_name_3in3']
     return df
 
+
+# ---------------------------
+# Raw ingest helper (incremental append by game_pk)
+# ---------------------------
+
+def _append_raw_incremental(new_games: pd.DataFrame, out_path: str) -> None:
+    """
+    Append new raw games to `out_path` CSV, de-duplicating by game_pk.
+
+    - If the file doesn't exist, just writes `new_games`.
+    - If it exists, merges existing + new and keeps the last row per game_pk.
+    """
+    # If nothing to add, just return
+    if new_games is None or len(new_games) == 0:
+        print("[raw] no new games to append.")
+        return
+
+    # We expect game_pk + game_date + game_datetime in the new data,
+    # but we only *require* game_pk to dedup.
+    if "game_pk" not in new_games.columns:
+        raise ValueError("new_games must contain a 'game_pk' column for incremental append.")
+
+    # Existing file?
+    if os.path.exists(out_path):
+        try:
+            existing = pd.read_csv(
+                out_path,
+                parse_dates=["game_date", "game_datetime"],
+                low_memory=False,
+            )
+        except Exception:
+            # If the existing file is broken, fall back to new_games only
+            print("[raw][warn] Failed to read existing raw file, overwriting with new data.")
+            existing = pd.DataFrame()
+    else:
+        existing = pd.DataFrame()
+
+    # Concatenate and drop duplicate game_pk
+    if not existing.empty:
+        cols = sorted(set(existing.columns).union(new_games.columns))
+        existing = existing.reindex(columns=cols)
+        new_games = new_games.reindex(columns=cols)
+        out = pd.concat([existing, new_games], ignore_index=True)
+    else:
+        out = new_games.copy()
+
+    if "game_date" in out.columns:
+        out = out.sort_values(["game_date", "game_pk"])
+    else:
+        out = out.sort_values(["game_pk"])
+
+    out = out.drop_duplicates(subset=["game_pk"], keep="last").reset_index(drop=True)
+    out.to_csv(out_path, index=False)
+    print(f"[raw] wrote {len(out):,} rows to {out_path} (after dedup by game_pk).")
+
+
+
 def _ingest_year_to_raw(
     year: int,
     backfill_days: int = 35,
@@ -2024,76 +2081,128 @@ def _ingest_year_to_raw(
     max_workers: int = 20,
 ) -> tuple[str, str]:
     """
-    Fetch schedule+probables for the given YEAR, including a warmup window that
-    starts `backfill_days` before Jan 1. Merge & dedupe into `out/raw_games.csv`.
-    Keeps only rows within [year_start - backfill_days, Dec 31 year].
-    Returns (year_start_str, year_end_str) for downstream feature building.
+    Fetch schedule+probables for the given YEAR, but only for dates that are not
+    already present in out_path. Uses a warmup window (backfill_days) so rolling
+    features have enough context.
 
-    Requires your file to define:
-      fetch_games_with_probables_statsapi_fast(start_date, end_date, include_finished, fetch_handedness, max_workers, debug)
+    - Looks at existing out_path (if any) to find the latest game_date for this year.
+    - Calls the API only from (latest_date + 1 - backfill_days) onward (clamped to
+      year_start - backfill_days).
+    - Merges & dedupes by game_pk and keeps only rows within
+      [year_start - backfill_days, year_end].
+
+    Returns (year_start_str, year_end_str) for downstream feature building.
     """
+
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     year_start = datetime(year, 1, 1).date()
     year_end   = datetime(year, 12, 31).date()
     warmup_start = (year_start - timedelta(days=backfill_days))
 
-    start_date = warmup_start.strftime("%Y-%m-%d")
-    end_date   = year_end.strftime("%Y-%m-%d")
+    # -----------------------------
+    # 1) Load existing raw + detect latest date for THIS year
+    # -----------------------------
+    if os.path.exists(out_path):
+        existing = pd.read_csv(out_path, low_memory=False)
+        if "game_date" in existing.columns:
+            existing["game_date"] = pd.to_datetime(existing["game_date"], errors="coerce").dt.date
+        else:
+            existing["game_date"] = pd.NaT
+    else:
+        existing = pd.DataFrame(columns=["game_pk", "game_date"])
 
-    print(f"📥 Ingesting YEAR {year} with warmup → {start_date} to {end_date}")
+    before = len(existing)
 
-    # Pull once for the whole span (warmup → Dec 31)
+    latest_for_year: date | None = None
+    if not existing.empty and "game_date" in existing.columns:
+        mask_year = (existing["game_date"] >= year_start) & (existing["game_date"] <= year_end)
+        if mask_year.any():
+            latest_for_year = existing.loc[mask_year, "game_date"].max()
+
+    # -----------------------------
+    # 2) Decide API span
+    # -----------------------------
+    if latest_for_year is None:
+        # No data yet for this year → full warmup span
+        api_start = warmup_start
+    else:
+        # We already have data up to latest_for_year; only fetch forward,
+        # but back up by backfill_days so rolling windows have context.
+        api_start = latest_for_year + timedelta(days=1) - timedelta(days=backfill_days)
+        api_start = max(api_start, warmup_start)
+
+    # If we’re already past Dec 31 of this year, nothing to do
+    if api_start > year_end:
+        print(
+            f"📥 YEAR {year}: already up to date "
+            f"(latest={latest_for_year}, backfill={backfill_days}d) — skipping API call."
+        )
+        # Just trim existing to the desired window and re-save for cleanliness
+        all_df = existing.copy()
+        if "game_date" in all_df.columns:
+            mask_keep = (all_df["game_date"] >= warmup_start) & (all_df["game_date"] <= year_end)
+            all_df = all_df.loc[mask_keep].copy()
+        all_df.to_csv(out_path, index=False)
+        print(f"[ingest] No new games to add. Total still {len(all_df):,} rows.")
+        return (year_start.strftime("%Y-%m-%d"), year_end.strftime("%Y-%m-%d"))
+
+    api_start_str = api_start.strftime("%Y-%m-%d")
+    api_end_str   = year_end.strftime("%Y-%m-%d")
+
+    print(f"📥 Ingesting YEAR {year} with warmup → {api_start_str} to {api_end_str}")
+    # -----------------------------
+    # 3) Pull new span from API
+    # -----------------------------
     new_df = fetch_games_with_probables_statsapi_fast(
-        start_date=start_date,
-        end_date=end_date,
+        start_date=api_start_str,
+        end_date=api_end_str,
         include_finished=include_finished,
         fetch_handedness=fetch_handedness,
         max_workers=max_workers,
         debug=False,
     )
 
-    # Load existing (if any)
-    if os.path.exists(out_path):
-        existing = pd.read_csv(out_path)
-        # Normalize date columns for consistent filtering/merge
-        for c in ("game_date", "game_datetime"):
-            if c in existing.columns:
-                existing[c] = pd.to_datetime(existing[c], errors="coerce")
-    else:
-        existing = pd.DataFrame()
+    if new_df is None or len(new_df) == 0:
+        print(f"[ingest] API returned no rows for {api_start_str} → {api_end_str}.")
+        new_df = pd.DataFrame()
 
-    before = len(existing)
+    # Normalize dates in new data
+    if "game_date" in new_df.columns:
+        new_df["game_date"] = pd.to_datetime(new_df["game_date"], errors="coerce").dt.date
 
-    # Merge & dedupe by game_pk
+    # -----------------------------
+    # 4) Merge & dedupe by game_pk
+    # -----------------------------
     if not existing.empty:
-        all_df = pd.concat([existing, new_df], ignore_index=True)
+        cols = sorted(set(existing.columns).union(new_df.columns))
+        existing = existing.reindex(columns=cols)
+        new_df   = new_df.reindex(columns=cols)
+        all_df   = pd.concat([existing, new_df], ignore_index=True)
     else:
         all_df = new_df.copy()
 
     if "game_pk" in all_df.columns:
         # Sort so the latest API record per game wins
-        sort_cols = [c for c in ["game_pk", "game_datetime"] if c in all_df.columns]
+        sort_cols = [c for c in ["game_pk", "game_datetime", "game_date"] if c in all_df.columns]
         if sort_cols:
             all_df = all_df.sort_values(sort_cols, na_position="last")
         all_df = all_df.drop_duplicates(subset=["game_pk"], keep="last")
     else:
         all_df = all_df.drop_duplicates()
 
-    # Keep only warmup + target year rows
+    # Keep only warmup + target year rows for this year
     if "game_date" in all_df.columns:
         all_df["game_date"] = pd.to_datetime(all_df["game_date"], errors="coerce").dt.date
         mask_keep = (all_df["game_date"] >= warmup_start) & (all_df["game_date"] <= year_end)
         all_df = all_df.loc[mask_keep].copy()
 
-    # Progress message
     added = len(all_df) - before
     if added <= 0:
         print(f"[ingest] No new games to add. Total still {len(all_df):,} rows.")
     else:
         print(f"[ingest] {added:,} new games added (total {len(all_df):,} rows).")
 
-    # Save
     all_df.to_csv(out_path, index=False)
     print(f"[ingest] Saved → {out_path}")
 

@@ -266,9 +266,9 @@ if __name__ == "__main__":
     ap.add_argument("--base-year", type=int, default=2024)
     ap.add_argument("--update-to", type=str, default=None, help="YYYY-MM-DD (default: today UTC)")
     # Backfills + cap
-    ap.add_argument("--ingest-backfill-days", type=int, default=80)
-    ap.add_argument("--feature-backfill-days", type=int, default=80)
-    ap.add_argument("--max-update-days", type=int, default=80)
+    ap.add_argument("--ingest-backfill-days", type=int, default=7)
+    ap.add_argument("--feature-backfill-days", type=int, default=30)
+    ap.add_argument("--max-update-days", type=int, default=40)
     # Concurrency
     ap.add_argument("--max-workers", type=int, default=20)
     # Scripts / runtime

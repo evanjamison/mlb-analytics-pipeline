@@ -113,14 +113,15 @@ jobs:
             --base-year 2024 \
             --features-base "out/mlb_features_full_20240328_to_20240929.csv" \
             --features-combined "out/mlb_features_combined.csv" \
+	    --raw "out/raw_games.csv" \
             --prepared "out/mlb_features_prepared.csv" \
             --model-out "model_all_ts" \
-            --ingest-backfill-days 80 \
-            --feature-backfill-days 80 \
-            --max-update-days 80 \
+            --ingest-backfill-days 7 \
+            --feature-backfill-days 30 \
+            --max-update-days 40 \
             --run-eda \
             --add-rolling \
-            --add-interactions
+            --add-interactions 
 
       # 7) Artifacts
       - name: Upload artifacts (reports + datasets)
