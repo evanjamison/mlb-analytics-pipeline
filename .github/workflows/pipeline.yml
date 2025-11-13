@@ -1,9 +1,10 @@
-name: MLB daily update & retrain
+name: MLB weekly update & retrain
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "15 17 * * *"   # 09:15 AM Pacific (17:15 UTC)
+    # Every Monday at 17:15 UTC (about 09:15 AM Pacific)
+    - cron: "15 17 * * 1"
 
 permissions:
   contents: write
@@ -20,8 +21,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      # 1b) Gate: only run pipeline on/after 2026-03-01
+      - name: Check calendar window (start March 2026)
+        shell: bash
+        run: |
+          set -euo pipefail
+          today_ymd=$(date -u +%Y%m%d)
+          echo "Today (UTC): $today_ymd"
+          if [[ "$today_ymd" -lt "20260301" ]]; then
+            echo "::notice::Before 2026-03-01; skipping pipeline steps."
+            echo "RUN_PIPELINE=false" >> "$GITHUB_ENV"
+          else
+            echo "RUN_PIPELINE=true" >> "$GITHUB_ENV"
+          fi
+
       # 2) Python
       - name: Set up Python 3.11
+        if: env.RUN_PIPELINE == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -29,6 +45,7 @@ jobs:
 
       # 3) Deps
       - name: Install deps (try requirements.txt, else robust fallback)
+        if: env.RUN_PIPELINE == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -57,6 +74,7 @@ jobs:
 
       # 4) Guard (only block legacy flag if it's on run_pipeline.py line)
       - name: Guard legacy flag only on run_pipeline.py
+        if: env.RUN_PIPELINE == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -72,6 +90,7 @@ jobs:
 
       # 5) Seed/merge base → combined (first-run safe)
       - name: Seed or merge 2024 base into combined
+        if: env.RUN_PIPELINE == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -105,6 +124,7 @@ jobs:
 
       # 6) Run orchestrator (incremental update on top of combined)
       - name: Run orchestrator (run_pipeline.py)
+        if: env.RUN_PIPELINE == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -113,7 +133,6 @@ jobs:
             --base-year 2024 \
             --features-base "out/mlb_features_full_20240328_to_20240929.csv" \
             --features-combined "out/mlb_features_combined.csv" \
-	    --raw "out/raw_games.csv" \
             --prepared "out/mlb_features_prepared.csv" \
             --model-out "model_all_ts" \
             --ingest-backfill-days 7 \
@@ -121,11 +140,11 @@ jobs:
             --max-update-days 40 \
             --run-eda \
             --add-rolling \
-            --add-interactions 
+            --add-interactions
 
       # 7) Artifacts
       - name: Upload artifacts (reports + datasets)
-        if: always()
+        if: always() && env.RUN_PIPELINE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: mlb-artifacts
@@ -140,7 +159,7 @@ jobs:
 
       # 8) Commit any changes
       - name: Commit results (if changed)
-        if: success()
+        if: success() && env.RUN_PIPELINE == 'true'
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
@@ -149,7 +168,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "CI: merge 2024 base + incremental update + retrain"
+            git commit -m "CI: weekly merge 2024 base + incremental update + retrain"
             git push
           fi
 
@@ -176,6 +195,7 @@ jobs:
               <li><b>Started (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
             <p>Check the run logs and downloaded artifacts (mlb-artifacts) for details.</p>
+
 
 
 
