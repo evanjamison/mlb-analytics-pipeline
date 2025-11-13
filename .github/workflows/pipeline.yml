@@ -89,54 +89,36 @@ jobs:
 
           if [[ -z "${BASE_2024:-}" ]]; then
             echo "::warning::2024 base CSV not found in out/ or out_backup/. Continuing without base."
+          elif [[ ! -f out/mlb_features_combined.csv ]]; then
+            echo "Seeding combined from base: $BASE_2024"
+            cp "$BASE_2024" out/mlb_features_combined.csv
           else
-            echo "Found base at: $BASE_2024"
-
-            # If combined is missing, start it with base; otherwise merge + dedup
-            if [[ ! -f out/mlb_features_combined.csv ]]; then
-              cp "$BASE_2024" out/mlb_features_combined.csv
-            else
-              export BASE_2024  # pass to Python via env
-              python - << 'PY'
-import os
-import pandas as pd
-
-base = os.environ["BASE_2024"]
-comb = "out/mlb_features_combined.csv"
-
-dfb = pd.read_csv(base, parse_dates=["game_date"], low_memory=False)
-dfc = pd.read_csv(comb, parse_dates=["game_date"], low_memory=False)
-
-cols = sorted(set(dfb.columns).union(dfc.columns))
-dfb = dfb.reindex(columns=cols)
-dfc = dfc.reindex(columns=cols)
-
-out = pd.concat([dfb, dfc], ignore_index=True)
-if "game_pk" in out.columns:
-    out = (
-        out.sort_values(["game_date", "game_pk"])
-           .drop_duplicates("game_pk", keep="last")
-    )
-else:
-    out = out.drop_duplicates()
-
-out = out.sort_values("game_date")
-out.to_csv(comb, index=False)
-print(f"[merge] combined rows: {len(out):,}")
-PY
-            fi
+            echo "Merging base into existing combined from: $BASE_2024"
+            export BASE_2024
+            python -c "import os,pandas as pd; \
+base = os.environ['BASE_2024']; \
+comb = 'out/mlb_features_combined.csv'; \
+dfb = pd.read_csv(base, parse_dates=['game_date'], low_memory=False); \
+dfc = pd.read_csv(comb, parse_dates=['game_date'], low_memory=False); \
+cols = sorted(set(dfb.columns).union(dfc.columns)); \
+dfb = dfb.reindex(columns=cols); \
+dfc = dfc.reindex(columns=cols); \
+out = pd.concat([dfb, dfc], ignore_index=True); \
+import numpy as np; \
+out = (out.sort_values(['game_date','game_pk']).drop_duplicates('game_pk', keep='last') \
+       if 'game_pk' in out.columns else out.drop_duplicates()); \
+out = out.sort_values('game_date'); \
+out.to_csv(comb, index=False); \
+print('[merge] combined rows:', len(out))"
           fi
 
           # Ensure a minimal combined exists for later steps
           if [[ ! -f out/mlb_features_combined.csv ]]; then
             echo "[init] Creating empty combined as fallback"
-            python - << 'PY'
-import pandas as pd
-pd.DataFrame(
-    columns=["game_date", "game_pk", "home_win"]
-).to_csv("out/mlb_features_combined.csv", index=False)
-PY
+            python -c "import pandas as pd; \
+pd.DataFrame(columns=['game_date','game_pk','home_win']).to_csv('out/mlb_features_combined.csv', index=False)"
           fi
+
 
       # 6) Run orchestrator (incremental update on top of combined)
       - name: Run orchestrator (run_pipeline.py)
