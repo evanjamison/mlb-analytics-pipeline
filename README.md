@@ -4,8 +4,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11-blue" />
   <img src="https://img.shields.io/badge/Schedule-Weekly%20Auto--Run-success" />
-  <img src="https://img.shields.io/github/actions/workflow/status/evanjamison/mlb-pipeline/pipeline.yml?label=CI" />
-  <img src="https://img.shields.io/github/last-commit/evanjamison/mlb-pipeline" />
+  <img src="https://img.shields.io/github/actions/workflow/status/evanjamison/mlb-analytics-pipeline/pipeline.yml?label=CI" />
+  <img src="https://img.shields.io/github/last-commit/evanjamison/mlb-analytics-pipeline" />
 </p>
 
 ---
