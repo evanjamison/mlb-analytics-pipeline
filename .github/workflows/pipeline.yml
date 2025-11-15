@@ -21,19 +21,28 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 1b) Gate: only run pipeline on/after 2026-03-01
+      # 1b) Gate: scheduled runs only start on/after 2026-03-01
       - name: Check calendar window (start March 2026)
         shell: bash
         run: |
           set -euo pipefail
-          today_ymd=$(date -u +%Y%m%d)
-          echo "Today (UTC): $today_ymd"
-          if [[ "$today_ymd" -lt "20260301" ]]; then
-            echo "::notice::Before 2026-03-01; skipping pipeline steps."
-            echo "RUN_PIPELINE=false" >> "$GITHUB_ENV"
-          else
-            echo "RUN_PIPELINE=true" >> "$GITHUB_ENV"
+          echo "Event: $GITHUB_EVENT_NAME"
+
+          # If it's a scheduled run, enforce the March 2026 start date
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            today_ymd=$(date -u +%Y%m%d)
+            echo "Today (UTC): $today_ymd"
+
+            if [[ "$today_ymd" -lt "20260301" ]]; then
+              echo "::notice::Scheduled run before 2026-03-01; skipping pipeline steps."
+              echo "RUN_PIPELINE=false" >> "$GITHUB_ENV"
+              exit 0
+            fi
           fi
+
+          # For workflow_dispatch (manual) OR any date after 2026-03-01:
+          echo "RUN_PIPELINE=true" >> "$GITHUB_ENV"
+          echo "Pipeline is allowed to run."
 
       # 2) Python
       - name: Set up Python 3.11
@@ -195,6 +204,7 @@ jobs:
               <li><b>Started (UTC):</b> ${{ github.run_started_at }}</li>
             </ul>
             <p>Check the run logs and downloaded artifacts (mlb-artifacts) for details.</p>
+
 
 
 
