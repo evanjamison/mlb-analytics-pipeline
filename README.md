@@ -129,3 +129,6 @@ flowchart TD
     %% Data source at the top
     S[StatsAPI / PyBaseball] --> A
 ```
+## ROC Curve (Test Set)
+
+<img src="docs/roc_test_all.png" width="600"/>
