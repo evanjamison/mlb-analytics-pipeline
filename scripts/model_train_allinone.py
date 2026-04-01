@@ -11,6 +11,9 @@ model_train_allinone.py — walk-forward training + leaderboard + optional betti
 - Calibration: raw / platt / isotonic
 - Figures: ROC/PR (all), Reliability + Confusion (best), Walk-forward AUC
 - HTML report: index.html inside --outdir
+
+ADDED: Saves best model pipeline + metadata to model_all_ts/best_model.pkl
+       so predict_api.py can load and serve predictions without retraining.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
+import joblib
 
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -64,10 +68,9 @@ def _is_numeric_dtype(dtype) -> bool:
 
 # --- Anti-leak helpers ---
 
-# More targeted patterns: focus on explicit scores / final outcomes / status
 LEAKY_PATTERNS = [
-    r"(^|_)(home|away)_score($|_)",      # home_score, away_score, etc.
-    r"(^|_)(home|away)_runs($|_)",       # home_runs, away_runs, etc.
+    r"(^|_)(home|away)_score($|_)",
+    r"(^|_)(home|away)_runs($|_)",
     r"\bfinal(_score)?\b",
     r"\bresult\b",
     r"\bwin_prob(ability)?\b",
@@ -80,46 +83,29 @@ LEAKY_PATTERNS = [
     r"\bgame_state\b",
     r"\bpost(game)?\b",
     r"^post_",
-    r"after_",                           # any "after_" features
+    r"after_",
 ]
 LEAKY_REGEX = re.compile("|".join(LEAKY_PATTERNS), flags=re.IGNORECASE)
 
-# columns we never train on
 ALWAYS_DROP = {
-    "game_date", "game_datetime", "game_pk", "home_win",      # labels/ids/timestamps
-    "home_moneyline", "away_moneyline",                       # exclude odds by default
-    "_runs",                                                  # raw scoreboard total runs (post-game)
+    "game_date", "game_datetime", "game_pk", "home_win",
+    "home_moneyline", "away_moneyline",
+    "_runs",
 }
 
 def _is_leaky(col: str) -> bool:
-    """
-    Return True if a column name looks post-game / outcome-related.
-
-    We also hard-whitelist some known safe patterns that contain 'run' etc:
-    - 'rundiff'   (rolling run differential features)
-    - 'runfactor' (park factor)
-    - 'closeravail' (bullpen availability flag)
-    """
     lower = (col or "").lower()
-
-    # Hard whitelist for known good features that contain "run"/"closer"
     if any(key in lower for key in ("rundiff", "runfactor", "closeravail")):
         return False
-
     return bool(LEAKY_REGEX.search(lower))
 
 
 def _pick_feature_cols(df: pd.DataFrame, date_col: str, id_col: str, target: str) -> List[str]:
-    # Base drops: ids, target, odds, timestamps, and any ALWAYS_DROP that happen to exist
     drop = set([date_col, id_col, target]) | ALWAYS_DROP.intersection(df.columns)
-
     candidates = [c for c in df.columns if c not in drop]
-
-    # Detect leaky-looking cols
     leaky = [c for c in candidates if _is_leaky(c)]
     if leaky:
         print(f"[anti-leak] Excluding {len(leaky)} leaky columns: {leaky}")
-
     safe = [c for c in candidates if c not in leaky]
     if not safe:
         raise ValueError(
@@ -311,23 +297,18 @@ def run(args):
     if args.target not in df.columns:
         raise ValueError(f"{args.target} not in data.")
 
-    # Sort by date and clean target
     df[args.date_col] = _coerce_datetime(df[args.date_col])
     df = df.sort_values(args.date_col).reset_index(drop=True)
     df = df.dropna(subset=[args.target]).copy()
     y = df[args.target].astype(int).values
 
-    # Anti-leak dataset audit (warning only)
     sus = [c for c in df.columns if _is_leaky(c)]
     if sus:
-        print(f"[anti-leak][WARN] Dataset contains leaky-looking columns present in file: {sus} "
-              "(they will be excluded from features if not whitelisted).")
+        print(f"[anti-leak][WARN] Dataset contains leaky-looking columns: {sus}")
 
-    # Features + preprocessor
     feat_cols = _pick_feature_cols(df, args.date_col, args.id_col, args.target)
     pre, num_cols, cat_cols = make_preprocessor(df, feat_cols)
 
-    # Candidate models
     models = _model_list()
 
     def maybe_calibrate(est):
@@ -336,7 +317,6 @@ def run(args):
         method = "sigmoid" if args.calibration == "platt" else "isotonic"
         return CalibratedClassifierCV(est, method=method, cv="prefit")
 
-    # Splits
     if args.walkforward == "monthly":
         splits = _time_splits_monthly(df, args.date_col, args.n_splits)
     elif args.walkforward == "ts":
@@ -347,7 +327,6 @@ def run(args):
 
     leaderboard: List[Dict[str, Any]] = []
 
-    # Train across splits
     for name, base_est in models:
         print(f"\n=== Training: {name} ===")
         model_metrics = []
@@ -393,7 +372,6 @@ def run(args):
         leaderboard.append(agg)
         dfm.to_csv(os.path.join(args.outdir, f"metrics_folds_{name}.csv"), index=False)
 
-    # Leaderboard
     lb = pd.DataFrame(leaderboard)
     lb = (lb.sort_values(["auc_test","f1_test"], ascending=False)
           if "auc_test" in lb and lb["auc_test"].notna().any()
@@ -404,7 +382,6 @@ def run(args):
     lb_csv = os.path.join(args.outdir, "leaderboard.csv")
     lb_top.to_csv(lb_csv, index=False)
 
-    # Report JSON
     report = {
         "data": args.data,
         "rows": int(len(df)),
@@ -427,10 +404,9 @@ def run(args):
     with open(os.path.join(args.outdir, "report.json"), "w") as f:
         json.dump(report, f, indent=2)
 
-    # ---------- Figures ----------
+    # ---------- Figures + final fit for plotting + MODEL SAVE ----------
     figs_dir = os.path.join(args.outdir, "figs"); ensure_dir(figs_dir)
 
-    # Re-fit once on last split for plotting
     if len(splits):
         tr_idx, va_idx, te_idx = splits[-1]
         Xtr = df.iloc[tr_idx][feat_cols]; ytr = y[tr_idx]
@@ -440,6 +416,7 @@ def run(args):
         roc_curves, pr_curves = {}, {}
         best_name, best_auc = None, -1.0
         best_probs, best_thr, best_pred = None, 0.5, None
+        best_pipeline = None  # <-- NEW: track the best fitted pipeline
 
         for name, base_est in models:
             pipe = Pipeline([("pre", pre), ("clf", base_est)])
@@ -466,18 +443,62 @@ def run(args):
                 best_probs = p_te
                 best_thr   = _best_threshold(yva, clf.predict_proba(Xva)[:,1], args.threshold_strategy)
                 best_pred  = (p_te >= best_thr).astype(int)
+                best_pipeline = clf  # <-- NEW: save the winning pipeline object
 
-        # ROC all
+        # ----------------------------------------------------------------
+        # NEW: Re-fit the best model on ALL available data, then save it
+        # ----------------------------------------------------------------
+        if best_name is not None:
+            print(f"\n[save] Re-fitting best model ({best_name}) on full dataset for deployment...")
+
+            # Find the base estimator for best_name
+            best_base_est = dict(models)[best_name]
+            full_pipe = Pipeline([("pre", pre), ("clf", best_base_est)])
+            full_pipe.fit(df[feat_cols], y)
+
+            final_clf = full_pipe
+            if args.calibration != "raw":
+                # Use last 15% as held-out calibration set
+                n = len(df)
+                cal_idx = int(n * 0.85)
+                Xcal = df.iloc[cal_idx:][feat_cols]
+                ycal = y[cal_idx:]
+                Xcal_tr = full_pipe.named_steps["pre"].transform(Xcal)
+                method = "sigmoid" if args.calibration == "platt" else "isotonic"
+                cal = CalibratedClassifierCV(best_base_est, method=method, cv="prefit")
+                cal.fit(Xcal_tr, ycal)
+                final_clf = Pipeline([("pre", full_pipe.named_steps["pre"]), ("cal", cal)])
+
+            # Save model artifact + metadata together
+            model_artifact = {
+                "pipeline":      final_clf,        # sklearn Pipeline — call .predict_proba(X)
+                "feature_cols":  feat_cols,        # list[str] — columns the model expects
+                "threshold":     best_thr,         # float — optimal decision threshold
+                "model_name":    best_name,        # str   — e.g. "lgbm"
+                "auc_test":      best_auc,         # float — AUC on last walk-forward test fold
+                "calibration":   args.calibration, # str
+                "trained_on_rows": int(len(df)),
+                "date_range": {
+                    "min": str(df[args.date_col].min().date()),
+                    "max": str(df[args.date_col].max().date()),
+                },
+            }
+
+            model_path = os.path.join(args.outdir, "best_model.pkl")
+            joblib.dump(model_artifact, model_path)
+            print(f"[save] Best model saved → {model_path}")
+            print(f"       model={best_name}  AUC={best_auc:.4f}  threshold={best_thr:.4f}")
+            print(f"       features={len(feat_cols)}  rows={len(df)}")
+
+        # ---------- Plots ----------
         fig, ax = plt.subplots(figsize=(6,5))
         _plot_roc_all(ax, roc_curves, title="ROC — test_all")
         fig.savefig(os.path.join(figs_dir,"roc_test_all.png"), dpi=170); plt.close(fig)
 
-        # PR all
         fig, ax = plt.subplots(figsize=(6,5))
         _plot_pr_all(ax, pr_curves, title="PR — test_all")
         fig.savefig(os.path.join(figs_dir,"pr_test_all.png"), dpi=170); plt.close(fig)
 
-        # Reliability + Confusion for best model
         if best_probs is not None:
             fig, ax = plt.subplots(figsize=(6,5))
             _plot_reliability(ax, best_probs, yte, title=f"Reliability — best={best_name}")
@@ -487,14 +508,13 @@ def run(args):
             _plot_conf(ax, yte, best_pred, title=f"Confusion — best={best_name} (thr={best_thr:.2f})")
             fig.savefig(os.path.join(figs_dir,"confusion_best.png"), dpi=170); plt.close(fig)
 
-        # Walk-forward trend (if multiple splits)
         if len(splits) > 1 and best_name is not None:
             aucs = []
             for (tr, va, te) in splits:
                 Xtr = df.iloc[tr][feat_cols]; ytr = y[tr]
                 Xva = df.iloc[va][feat_cols]; yva = y[va]
                 Xte = df.iloc[te][feat_cols]; yte = y[te]
-                est = [m for m in models if m[0]==best_name][0][1]
+                est = dict(models)[best_name]
                 pipe = Pipeline([("pre", pre), ("clf", est)])
                 pipe.fit(Xtr, ytr)
                 clf = pipe
@@ -511,7 +531,6 @@ def run(args):
             ax.set_xlabel("split"); ax.set_ylabel("AUC"); ax.set_title(f"Walk-forward AUC — {best_name}")
             fig.savefig(os.path.join(figs_dir,"walkforward_auc.png"), dpi=170); plt.close(fig)
 
-    # HTML index (no f-strings with backslashes)
     walk_tag = '<img src="figs/walkforward_auc.png" style="max-width:700px;">' if len(splits) > 1 else ''
     html = (
         "<!doctype html>\n"
@@ -521,6 +540,7 @@ def run(args):
         "<ul>\n"
         '  <li><a href="leaderboard.csv">leaderboard.csv</a></li>\n'
         '  <li><a href="report.json">report.json</a></li>\n'
+        '  <li><a href="best_model.pkl">best_model.pkl (joblib)</a></li>\n'
         "</ul>\n"
         "<h2>Figures</h2>\n"
         '<img src="figs/roc_test_all.png" style="max-width:900px;"><br>\n'
@@ -555,7 +575,6 @@ if __name__ == "__main__":
     ap.add_argument("--topk", type=int, default=25)
     ap.add_argument("--threshold-strategy", choices=["f1","youden","balanced"], default="f1")
 
-    # kept for CLI compatibility (feature building is upstream)
     ap.add_argument("--add-rolling", action="store_true")
     ap.add_argument("--add-interactions", action="store_true")
 
@@ -563,7 +582,6 @@ if __name__ == "__main__":
     ap.add_argument("--walkforward", choices=["monthly","ts","none"], default="monthly")
     ap.add_argument("--n-splits", type=int, default=6)
 
-    # pass-through betting params (not used here, but accepted)
     ap.add_argument("--min-edge", type=float, default=0.02)
     ap.add_argument("--kelly-cap", type=float, default=0.05)
 
